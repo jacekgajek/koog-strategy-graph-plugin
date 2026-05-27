@@ -35,14 +35,14 @@ object ElkLayout {
         // SPACING_NODE_NODE is the in-layer (horizontal) gap. The between-layer
         // (vertical) gap is set separately and is what determines edge length —
         // it's what carries condition labels like "onToolCalls" without overlap.
-        root.setProperty(CoreOptions.SPACING_NODE_NODE, JBUIScale.scale(80f).toDouble())
-        root.setProperty(LayeredOptions.SPACING_NODE_NODE_BETWEEN_LAYERS, JBUIScale.scale(90f).toDouble())
-        root.setProperty(LayeredOptions.SPACING_EDGE_NODE_BETWEEN_LAYERS, JBUIScale.scale(40f).toDouble())
-        root.setProperty(LayeredOptions.SPACING_EDGE_EDGE_BETWEEN_LAYERS, JBUIScale.scale(25f).toDouble())
-        root.setProperty(CoreOptions.SPACING_EDGE_NODE, JBUIScale.scale(40f).toDouble())
-        root.setProperty(CoreOptions.SPACING_EDGE_EDGE, JBUIScale.scale(25f).toDouble())
-        root.setProperty(CoreOptions.SPACING_EDGE_LABEL, JBUIScale.scale(10f).toDouble())
-        root.setProperty(CoreOptions.PADDING, org.eclipse.elk.core.math.ElkPadding(JBUIScale.scale(36f).toDouble()))
+        root.setProperty(CoreOptions.SPACING_NODE_NODE, JBUIScale.scale(64f).toDouble())
+        root.setProperty(LayeredOptions.SPACING_NODE_NODE_BETWEEN_LAYERS, JBUIScale.scale(70f).toDouble())
+        root.setProperty(LayeredOptions.SPACING_EDGE_NODE_BETWEEN_LAYERS, JBUIScale.scale(32f).toDouble())
+        root.setProperty(LayeredOptions.SPACING_EDGE_EDGE_BETWEEN_LAYERS, JBUIScale.scale(20f).toDouble())
+        root.setProperty(CoreOptions.SPACING_EDGE_NODE, JBUIScale.scale(32f).toDouble())
+        root.setProperty(CoreOptions.SPACING_EDGE_EDGE, JBUIScale.scale(20f).toDouble())
+        root.setProperty(CoreOptions.SPACING_EDGE_LABEL, JBUIScale.scale(8f).toDouble())
+        root.setProperty(CoreOptions.PADDING, org.eclipse.elk.core.math.ElkPadding(JBUIScale.scale(28f).toDouble()))
 
         val elkNodes = graph.nodes.associate { node ->
             val n = ElkGraphUtil.createNode(root)
