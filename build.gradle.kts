@@ -43,6 +43,15 @@ intellijPlatform {
             untilBuild = provider { null }
         }
     }
+    publishing {
+        // Token: https://plugins.jetbrains.com/author/me/tokens
+        // Read from -Pintellijplatform.publish.token=... or env INTELLIJ_PLATFORM_PUBLISH_TOKEN.
+        token = providers.environmentVariable("INTELLIJ_PLATFORM_PUBLISH_TOKEN")
+            .orElse(providers.gradleProperty("intellijplatform.publish.token"))
+        // Channel: "default" (stable, visible to everyone) or "eap"/"beta" (only users who
+        // add the channel URL). Override per-publish with -Pchannel=eap.
+        channels = providers.gradleProperty("channel").map { listOf(it) }.orElse(listOf("default"))
+    }
 }
 
 tasks {
