@@ -12,6 +12,8 @@ import java.awt.Dimension
 import java.awt.Graphics
 import java.awt.Graphics2D
 import java.awt.RenderingHints
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseWheelEvent
@@ -27,6 +29,7 @@ class GraphPanel(
 ) : JPanel() {
 
     private var scale: Double = 1.0
+    private var fitMode: Boolean = true
     private var hovered: LaidOutNode? = null
 
     init {
@@ -38,6 +41,12 @@ class GraphPanel(
             (graph.height * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(360)),
         )
         toolTipText = ""
+
+        addComponentListener(object : ComponentAdapter() {
+            override fun componentResized(e: ComponentEvent) {
+                if (fitMode) repaint()
+            }
+        })
 
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -64,10 +73,25 @@ class GraphPanel(
         })
         addMouseWheelListener { e: MouseWheelEvent ->
             val factor = if (e.preciseWheelRotation < 0) 1.1 else 1 / 1.1
-            scale = (scale * factor).coerceIn(0.4, 3.0)
+            fitMode = false
+            scale = (scale * factor).coerceIn(0.2, 4.0)
             revalidate()
             repaint()
         }
+    }
+
+    /** Re-enable auto-fit; the next paint recomputes scale from current size. */
+    fun fitToWindow() {
+        fitMode = true
+        repaint()
+    }
+
+    private fun computeFitScale() {
+        if (graph.width <= 0 || graph.height <= 0) return
+        val pad = JBUIScale.scale(40).toDouble() * 2
+        val availW = (width - pad).coerceAtLeast(1.0)
+        val availH = (height - pad).coerceAtLeast(1.0)
+        scale = minOf(availW / graph.width, availH / graph.height).coerceIn(0.2, 4.0)
     }
 
     override fun getToolTipText(e: MouseEvent): String? {
@@ -111,6 +135,7 @@ class GraphPanel(
     }
 
     override fun paintComponent(g: Graphics) {
+        if (fitMode) computeFitScale()
         super.paintComponent(g)
         val g2 = (g as Graphics2D)
         g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
