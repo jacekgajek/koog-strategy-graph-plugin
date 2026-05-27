@@ -71,6 +71,90 @@ You should see seven nodes (`nodeStart` and `nodeFinish` as Start/Finish in
 green/red, the five `val`-declared nodes in blue) and eight edges, four of
 them labeled with their condition name.
 
+### Big fixture — branches, back-edges, multiple conditions, unknown ref
+
+Stress-tests the layered layout: a research-agent shape with 13 declared
+nodes, 22 edges, two tool-execution loops that branch on tool name, a
+judge node with three different outcomes, and one undeclared reference
+(`escalate`) to show off the dashed-yellow Unknown style.
+
+```kotlin
+fun streamConsolidator(): Any = Unit
+fun nodeJudge(): Any = Unit
+fun nodeSummarize(): Any = Unit
+fun nodeHandleError(): Any = Unit
+
+fun researchAgent() {
+    strategy<UserQuery, FinalReport>("research_agent") {
+        val planResearch by nodeLLMRequestStreaming()
+        val consolidatePlan by streamConsolidator()
+
+        val executeSearch by nodeExecuteTools()
+        val readSearch by nodeLLMSendToolResultsStreaming()
+        val consolidateSearch by streamConsolidator()
+
+        val executeFetch by nodeExecuteTools()
+        val readFetch by nodeLLMSendToolResultsStreaming()
+        val consolidateFetch by streamConsolidator()
+
+        val judge by nodeJudge()
+        val refineQuestion by nodeLLMRequestStreaming()
+        val consolidateRefine by streamConsolidator()
+
+        val summarize by nodeSummarize()
+        val handleError by nodeHandleError()
+
+        // Planning phase
+        edge(nodeStart forwardTo planResearch)
+        edge(planResearch forwardTo consolidatePlan)
+        edge(consolidatePlan forwardTo executeSearch onToolCalls { true })
+        edge(consolidatePlan forwardTo handleError onError { true })
+
+        // Search loop — can re-search or hand off to fetch
+        edge(executeSearch forwardTo readSearch)
+        edge(readSearch forwardTo consolidateSearch)
+        edge(consolidateSearch forwardTo executeFetch onToolCalls { name == "fetch" })
+        edge(consolidateSearch forwardTo executeSearch onToolCalls { name == "search" })
+        edge(consolidateSearch forwardTo judge onTextMessage { true })
+
+        // Fetch loop — can re-fetch or hand back to search
+        edge(executeFetch forwardTo readFetch)
+        edge(readFetch forwardTo consolidateFetch)
+        edge(consolidateFetch forwardTo executeFetch onToolCalls { name == "fetch" })
+        edge(consolidateFetch forwardTo executeSearch onToolCalls { name == "search" })
+        edge(consolidateFetch forwardTo judge onTextMessage { true })
+
+        // Judge fans out three ways — note `escalate` is referenced but
+        // never declared, so it renders as a dashed-yellow Unknown box.
+        edge(judge forwardTo summarize onApproved { confidence > 0.8 })
+        edge(judge forwardTo refineQuestion onRejected { true })
+        edge(judge forwardTo escalate onError { true })
+
+        // Refinement re-enters the search loop
+        edge(refineQuestion forwardTo consolidateRefine)
+        edge(consolidateRefine forwardTo executeSearch onToolCalls { true })
+        edge(consolidateRefine forwardTo judge onTextMessage { true })
+
+        edge(summarize forwardTo nodeFinish)
+        edge(handleError forwardTo nodeFinish)
+    }
+}
+```
+
+What to look for after clicking the gutter icon:
+
+- **15 nodes**: green `nodeStart`, red `nodeFinish`, 13 blue declared, and
+  one dashed-yellow `escalate` (referenced, never declared).
+- **Back-edges** from `consolidateSearch`, `consolidateFetch`, and
+  `consolidateRefine` looping into earlier `execute*` nodes — ELK reverses
+  them under the hood and routes them around the side of the diagram.
+- **Five distinct condition labels** (`onToolCalls`, `onTextMessage`,
+  `onError`, `onApproved`, `onRejected`) — all sit on edge midpoints
+  without overlapping boxes.
+- Hovering an `onToolCalls` edge whose lambda is `{ name == "fetch" }` or
+  `{ confidence > 0.8 }` shows the full predicate in the tooltip.
+- Double-clicking `judge` jumps the caret to `val judge by nodeJudge()`.
+
 ## 3. Unit tests
 
 ```bash
