@@ -125,12 +125,8 @@ class GraphPanel(
         scale = minOf(availW / graph.width, availH / graph.height).coerceIn(0.2, 4.0)
     }
 
-    private fun buildTooltip(node: LaidOutNode?, edge: LaidOutEdge?): List<TooltipLine> {
-        if (node != null) {
-            val out = mutableListOf(TooltipLine(node.model.id, bold = true))
-            node.model.factory?.let { out += TooltipLine("by $it()", bold = false) }
-            return out
-        }
+    private fun buildTooltip(@Suppress("UNUSED_PARAMETER") node: LaidOutNode?, edge: LaidOutEdge?): List<TooltipLine> {
+        // Node labels already show id + factory; a tooltip would just repeat them.
         if (edge != null && edge.condition != null) {
             val out = mutableListOf(TooltipLine(edge.condition, bold = true))
             edge.conditionExpr?.takeIf { it.isNotBlank() }?.let {
