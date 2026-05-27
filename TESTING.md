@@ -21,11 +21,16 @@ Inside the sandbox IDE:
 2. Create a file like `Demo.kt` and paste the snippet from
    [Sample fixture](#sample-fixture) below.
 3. A small hierarchy icon appears in the gutter on the `strategy(` line.
-   Click it to open the graph popup.
-4. **Double-click a node** in the popup → caret jumps to the `val` declaration.
-5. **Hover** an edge labeled `onToolCalls` / `onTextMessage` → tooltip shows
-   the condition expression.
-6. **Mouse wheel** over the popup → zoom in/out.
+   Click it to open the **Koog Strategy** tool window (right side by
+   default — drag the tab anywhere or right-click → *Float* to detach).
+4. **Click a node** → caret jumps to the `val` declaration. **Click an
+   edge** → caret jumps to the matching `edge(a forwardTo b ...)` call.
+5. **Hover** an edge labeled `onToolCalls` / `onTextMessage` → custom
+   instant tooltip shows the condition lambda.
+6. **Mouse wheel** zooms; **left-drag** pans. Resizing the tool window
+   auto-fits the graph until the first pan/zoom.
+7. **Close** with the tool window's standard X (or `Shift+Esc` while
+   focused). Clicking another gutter icon replaces the contents.
 
 Stopping the sandbox IDE (just close it) returns control to the terminal.
 

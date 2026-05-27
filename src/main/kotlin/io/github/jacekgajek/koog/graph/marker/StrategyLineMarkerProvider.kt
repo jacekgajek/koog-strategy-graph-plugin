@@ -3,11 +3,12 @@ package io.github.jacekgajek.koog.graph.marker
 import com.intellij.codeInsight.daemon.LineMarkerInfo
 import com.intellij.codeInsight.daemon.LineMarkerProviderDescriptor
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.components.service
 import com.intellij.openapi.editor.markup.GutterIconRenderer
 import com.intellij.psi.PsiElement
 import com.intellij.psi.impl.source.tree.LeafPsiElement
 import io.github.jacekgajek.koog.graph.parser.StrategyParser
-import io.github.jacekgajek.koog.graph.render.GraphPopup
+import io.github.jacekgajek.koog.graph.tool.KoogGraphService
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
@@ -32,7 +33,7 @@ class StrategyLineMarkerProvider : LineMarkerProviderDescriptor() {
             element.textRange,
             AllIcons.Toolwindows.ToolWindowHierarchy,
             { "Show Koog strategy graph" },
-            { event, _ -> GraphPopup.show(call.project, call, event) },
+            { _, _ -> call.project.service<KoogGraphService>().showGraph(call) },
             GutterIconRenderer.Alignment.LEFT,
             { "Show Koog strategy graph" },
         )

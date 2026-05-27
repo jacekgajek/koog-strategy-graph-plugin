@@ -4,12 +4,13 @@
     <vendor email="jacek.gajek@example.com" url="https://github.com/jacekgajek">jacekgajek</vendor>
 
     <description><![CDATA[
-        <p>Inline visualization for <a href="https://github.com/JetBrains/koog">Koog</a>
+        <p>Visualization for <a href="https://github.com/JetBrains/koog">Koog</a>
         agent <code>strategy { ... }</code> DSL blocks.</p>
-        <p>A gutter icon next to every recognized <code>strategy(...)</code> call opens a
-        popup with a layered graph of all <code>val x by nodeXxx()</code> nodes and
-        <code>edge(a forwardTo b)</code> connections in that block. Layout is computed by
-        the Eclipse Layout Kernel; rendering is pure Swing &mdash; no external tools are
+        <p>A gutter icon next to every recognized <code>strategy(...)</code> call
+        loads a layered graph of all <code>val x by nodeXxx()</code> nodes and
+        <code>edge(a forwardTo b)</code> connections in that block into the
+        <em>Koog Strategy</em> tool window. Layout is computed by the Eclipse
+        Layout Kernel; rendering is pure Swing &mdash; no external tools are
         required.</p>
     ]]></description>
 
@@ -27,5 +28,10 @@
         <codeInsight.lineMarkerProvider
             language="kotlin"
             implementationClass="io.github.jacekgajek.koog.graph.marker.StrategyLineMarkerProvider"/>
+        <toolWindow
+            id="Koog Strategy"
+            anchor="right"
+            icon="AllIcons.Toolwindows.ToolWindowHierarchy"
+            factoryClass="io.github.jacekgajek.koog.graph.tool.KoogGraphToolWindowFactory"/>
     </extensions>
 </idea-plugin>
