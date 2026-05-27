@@ -8,6 +8,7 @@ import com.intellij.ui.scale.JBUIScale
 import io.github.jacekgajek.koog.graph.parser.NodeKind
 import java.awt.BasicStroke
 import java.awt.Color
+import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.Graphics
 import java.awt.Graphics2D
@@ -31,6 +32,7 @@ class GraphPanel(
     private var scale: Double = 1.0
     private var fitMode: Boolean = true
     private var hovered: LaidOutNode? = null
+    private var hoveredEdge: LaidOutEdge? = null
 
     init {
         background = JBColor.background()
@@ -63,8 +65,10 @@ class GraphPanel(
             }
 
             override fun mouseExited(e: MouseEvent) {
-                if (hovered != null) {
+                if (hovered != null || hoveredEdge != null) {
                     hovered = null
+                    hoveredEdge = null
+                    cursor = Cursor.getDefaultCursor()
                     repaint()
                 }
             }
@@ -72,10 +76,16 @@ class GraphPanel(
         addMouseMotionListener(object : MouseAdapter() {
             override fun mouseMoved(e: MouseEvent) {
                 val n = nodeAt(e.point)
-                if (n !== hovered) {
-                    hovered = n
-                    repaint()
+                val edge = if (n == null) edgeAt(e.point) else null
+                val changed = n !== hovered || edge !== hoveredEdge
+                hovered = n
+                hoveredEdge = edge
+                cursor = if (n != null || edge != null) {
+                    Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                } else {
+                    Cursor.getDefaultCursor()
                 }
+                if (changed) repaint()
             }
         })
         addMouseWheelListener { e: MouseWheelEvent ->
@@ -120,10 +130,10 @@ class GraphPanel(
         return graph.nodes.firstOrNull { it.bounds.contains(gp) }
     }
 
-    /** Crude edge hit test: distance to any segment under 4px (in graph coords). */
+    /** Edge hit test: distance to any segment under ~7 device px, in graph coords. */
     private fun edgeAt(p: java.awt.Point): LaidOutEdge? {
         val gp = toGraph(p)
-        val tol = 4.0
+        val tol = (JBUIScale.scale(7f).toDouble() / scale).coerceAtLeast(4.0)
         return graph.edges.firstOrNull { edge ->
             edge.points.zipWithNext().any { (a, b) -> distanceToSegment(gp, a, b) < tol }
         }
@@ -160,15 +170,25 @@ class GraphPanel(
 
     private fun paintEdges(g2: Graphics2D) {
         val edgeColor = JBColor(Color(0x6B6B6B), Color(0xB3B3B3))
+        val edgeColorHover = JBColor(Color(0x2E5BBA), Color(0x6FA8FF))
         val labelBg = JBColor.background()
         g2.font = GraphMetrics.subFont
         val fm = g2.getFontMetrics(GraphMetrics.subFont)
 
-        g2.color = edgeColor
-        g2.stroke = BasicStroke(1.4f)
+        val baseStrokeW = (JBUIScale.scale(2.5f) / scale.toFloat()).coerceAtLeast(1.0f)
+        val hoverStrokeW = (JBUIScale.scale(3.6f) / scale.toFloat()).coerceAtLeast(1.4f)
+        val arrowSize = (JBUIScale.scale(12f).toDouble() / scale).coerceAtLeast(7.0)
 
         graph.edges.forEach { edge ->
             if (edge.points.size < 2) return@forEach
+            val isHover = edge === hoveredEdge
+            g2.color = if (isHover) edgeColorHover else edgeColor
+            g2.stroke = BasicStroke(
+                if (isHover) hoverStrokeW else baseStrokeW,
+                BasicStroke.CAP_ROUND,
+                BasicStroke.JOIN_ROUND,
+            )
+
             val path = Path2D.Double().apply {
                 val first = edge.points.first()
                 moveTo(first.x, first.y)
@@ -178,7 +198,7 @@ class GraphPanel(
 
             val last = edge.points.last()
             val prev = edge.points[edge.points.size - 2]
-            drawArrowHead(g2, prev, last)
+            drawArrowHead(g2, prev, last, arrowSize)
 
             edge.condition?.let { cond ->
                 val mid = midpoint(edge.points)
@@ -190,7 +210,7 @@ class GraphPanel(
                 val ry = mid.y - th / 2 - padY
                 g2.color = labelBg
                 g2.fillRoundRect(rx.toInt(), ry.toInt(), (tw + 2 * padX).toInt(), (th + 2 * padY).toInt(), 8, 8)
-                g2.color = edgeColor
+                g2.color = if (isHover) edgeColorHover else edgeColor
                 g2.drawString(cond, (mid.x - tw / 2).toFloat(), (mid.y + fm.ascent / 2.0 - 2).toFloat())
             }
         }
@@ -277,9 +297,8 @@ class GraphPanel(
             return points.last()
         }
 
-        private fun drawArrowHead(g2: Graphics2D, from: Point2D.Double, to: Point2D.Double) {
+        private fun drawArrowHead(g2: Graphics2D, from: Point2D.Double, to: Point2D.Double, size: Double) {
             val angle = Math.atan2(to.y - from.y, to.x - from.x)
-            val size = 8.0
             val x1 = to.x - size * Math.cos(angle - Math.PI / 7)
             val y1 = to.y - size * Math.sin(angle - Math.PI / 7)
             val x2 = to.x - size * Math.cos(angle + Math.PI / 7)
