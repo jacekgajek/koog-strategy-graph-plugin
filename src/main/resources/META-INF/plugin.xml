@@ -1,0 +1,31 @@
+<idea-plugin>
+    <id>io.github.jacekgajek.koog-strategy-graph</id>
+    <name>Koog Strategy Graph</name>
+    <vendor email="jacek.gajek@example.com" url="https://github.com/jacekgajek">jacekgajek</vendor>
+
+    <description><![CDATA[
+        <p>Inline visualization for <a href="https://github.com/JetBrains/koog">Koog</a>
+        agent <code>strategy { ... }</code> DSL blocks.</p>
+        <p>A gutter icon next to every recognized <code>strategy(...)</code> call opens a
+        popup with a layered graph of all <code>val x by nodeXxx()</code> nodes and
+        <code>edge(a forwardTo b)</code> connections in that block. Layout is computed by
+        the Eclipse Layout Kernel; rendering is pure Swing &mdash; no external tools are
+        required.</p>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <h3>0.1.0</h3>
+        <ul>
+            <li>Initial release: gutter icon + popup graph.</li>
+        </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.kotlin</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <codeInsight.lineMarkerProvider
+            language="kotlin"
+            implementationClass="io.github.jacekgajek.koog.graph.marker.StrategyLineMarkerProvider"/>
+    </extensions>
+</idea-plugin>
