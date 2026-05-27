@@ -1,5 +1,7 @@
 package io.github.jacekgajek.koog.graph.render
 
+import com.intellij.ui.scale.JBUIScale
+import com.intellij.util.ui.JBFont
 import java.awt.Font
 import java.awt.font.FontRenderContext
 
@@ -7,37 +9,41 @@ import java.awt.font.FontRenderContext
  * Shared font + sizing between [ElkLayout] (where nodes get their box sizes
  * before layout) and [GraphPanel] (where the same boxes are painted). They
  * must agree, or text overflows the box.
+ *
+ * All sizes go through [JBUIScale] so the graph keeps a consistent visual
+ * footprint across IDE UI scales (HiDPI screens, "Presentation Mode", etc.).
+ * Raw `java.awt.Font(..., size)` constants render at literal pixel sizes and
+ * look microscopic on Linux/X11 HiDPI — use [JBFont] instead.
  */
 object GraphMetrics {
 
-    val mainFont: Font = Font(Font.SANS_SERIF, Font.PLAIN, 13)
-    val subFont: Font = Font(Font.SANS_SERIF, Font.PLAIN, 12)
+    /** ID label font — follows the IDE's label font (scale-aware). */
+    val mainFont: Font get() = JBFont.label()
+
+    /** Subtitle ("by foo()") font — same size as main, differentiated by color. */
+    val subFont: Font get() = JBFont.label()
 
     private val frc = FontRenderContext(null, true, true)
 
-    /** Horizontal padding from text to box edge, per side. */
-    const val PAD_X = 18.0
-    /** Vertical padding from text to box edge, per side. */
-    const val PAD_Y = 10.0
-    /** Gap between the id line and the factory line. */
-    const val LINE_GAP = 4.0
-    /** Minimum box width regardless of label length. */
-    const val MIN_WIDTH = 150.0
+    val padX: Double get() = JBUIScale.scale(20f).toDouble()
+    val padY: Double get() = JBUIScale.scale(12f).toDouble()
+    val lineGap: Double get() = JBUIScale.scale(4f).toDouble()
+    val minWidth: Double get() = JBUIScale.scale(160f).toDouble()
 
     fun textWidth(font: Font, text: String): Double =
         font.getStringBounds(text, frc).width
 
     fun lineHeight(font: Font): Double =
-        font.getLineMetrics("Ag", frc).let { (it.ascent + it.descent + it.leading).toDouble() }
+        font.getLineMetrics("Ag", frc).run { (ascent + descent + leading).toDouble() }
 
     fun nodeSize(label: String, factory: String?): Pair<Double, Double> {
         val mainW = textWidth(mainFont, label)
         val subText = factory?.let { "by $it()" }
         val subW = subText?.let { textWidth(subFont, it) } ?: 0.0
-        val width = maxOf(mainW, subW) + 2 * PAD_X
+        val width = maxOf(mainW, subW) + 2 * padX
         val mainH = lineHeight(mainFont)
-        val subH = if (factory != null) lineHeight(subFont) + LINE_GAP else 0.0
-        val height = mainH + subH + 2 * PAD_Y
-        return width.coerceAtLeast(MIN_WIDTH) to height
+        val subH = if (factory != null) lineHeight(subFont) + lineGap else 0.0
+        val height = mainH + subH + 2 * padY
+        return width.coerceAtLeast(minWidth) to height
     }
 }

@@ -5,6 +5,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.ui.awt.RelativePoint
+import com.intellij.ui.scale.JBUIScale
 import io.github.jacekgajek.koog.graph.parser.StrategyParser
 import org.jetbrains.kotlin.psi.KtCallExpression
 import java.awt.Dimension
@@ -27,7 +28,7 @@ object GraphPopup {
             .setFocusable(true)
             .setCancelOnClickOutside(true)
             .setCancelOnOtherWindowOpen(true)
-            .setMinSize(Dimension(420, 320))
+            .setMinSize(Dimension(JBUIScale.scale(480), JBUIScale.scale(360)))
             .createPopup()
 
         popup.show(RelativePoint(event))

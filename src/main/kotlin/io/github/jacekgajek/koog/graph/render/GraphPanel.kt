@@ -4,6 +4,7 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
 import com.intellij.ui.JBColor
+import com.intellij.ui.scale.JBUIScale
 import io.github.jacekgajek.koog.graph.parser.NodeKind
 import java.awt.BasicStroke
 import java.awt.Color
@@ -31,9 +32,10 @@ class GraphPanel(
     init {
         background = JBColor.background()
         isFocusable = true
+        val margin = JBUIScale.scale(40)
         preferredSize = Dimension(
-            (graph.width * scale + 40).toInt().coerceAtLeast(420),
-            (graph.height * scale + 40).toInt().coerceAtLeast(320),
+            (graph.width * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(480)),
+            (graph.height * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(360)),
         )
         toolTipText = ""
 
@@ -102,8 +104,9 @@ class GraphPanel(
     }
 
     private fun origin(): Pair<Double, Double> {
-        val ox = ((width - graph.width * scale) / 2).coerceAtLeast(20.0)
-        val oy = 20.0
+        val pad = JBUIScale.scale(20f).toDouble()
+        val ox = ((width - graph.width * scale) / 2).coerceAtLeast(pad)
+        val oy = pad
         return ox to oy
     }
 
@@ -183,7 +186,7 @@ class GraphPanel(
             if (factory != null) {
                 val mainH = mainFm.ascent + mainFm.descent.toDouble()
                 val subH = subFm.ascent + subFm.descent.toDouble()
-                val totalH = mainH + GraphMetrics.LINE_GAP + subH
+                val totalH = mainH + GraphMetrics.lineGap + subH
                 val topY = b.y + (b.height - totalH) / 2.0
 
                 g2.font = GraphMetrics.mainFont
@@ -193,7 +196,7 @@ class GraphPanel(
 
                 val facText = "by $factory()"
                 val facW = subFm.stringWidth(facText)
-                val facBaseline = idBaseline + mainFm.descent + GraphMetrics.LINE_GAP + subFm.ascent
+                val facBaseline = idBaseline + mainFm.descent + GraphMetrics.lineGap + subFm.ascent
                 g2.font = GraphMetrics.subFont
                 g2.color = JBColor(Color(0x7A7A7A), Color(0x9E9E9E))
                 g2.drawString(facText, (xCenter - facW / 2).toFloat(), facBaseline.toFloat())

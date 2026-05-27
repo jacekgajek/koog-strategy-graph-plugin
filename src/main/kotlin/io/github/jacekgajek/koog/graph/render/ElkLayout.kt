@@ -1,6 +1,7 @@
 package io.github.jacekgajek.koog.graph.render
 
 import io.github.jacekgajek.koog.graph.parser.StrategyGraph
+import com.intellij.ui.scale.JBUIScale
 import org.eclipse.elk.alg.layered.options.LayeredOptions
 import org.eclipse.elk.core.RecursiveGraphLayoutEngine
 import org.eclipse.elk.core.data.LayoutMetaDataService
@@ -31,10 +32,10 @@ object ElkLayout {
         root.setProperty(CoreOptions.ALGORITHM, "org.eclipse.elk.layered")
         root.setProperty(CoreOptions.DIRECTION, Direction.DOWN)
         root.setProperty(CoreOptions.EDGE_ROUTING, EdgeRouting.ORTHOGONAL)
-        root.setProperty(CoreOptions.SPACING_NODE_NODE, 60.0)
-        root.setProperty(CoreOptions.SPACING_EDGE_NODE, 35.0)
-        root.setProperty(CoreOptions.SPACING_EDGE_EDGE, 20.0)
-        root.setProperty(CoreOptions.PADDING, org.eclipse.elk.core.math.ElkPadding(32.0))
+        root.setProperty(CoreOptions.SPACING_NODE_NODE, JBUIScale.scale(60f).toDouble())
+        root.setProperty(CoreOptions.SPACING_EDGE_NODE, JBUIScale.scale(35f).toDouble())
+        root.setProperty(CoreOptions.SPACING_EDGE_EDGE, JBUIScale.scale(20f).toDouble())
+        root.setProperty(CoreOptions.PADDING, org.eclipse.elk.core.math.ElkPadding(JBUIScale.scale(32f).toDouble()))
 
         val elkNodes = graph.nodes.associate { node ->
             val n = ElkGraphUtil.createNode(root)
