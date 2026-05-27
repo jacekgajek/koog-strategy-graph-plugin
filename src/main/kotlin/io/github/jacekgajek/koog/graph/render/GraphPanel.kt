@@ -126,7 +126,8 @@ class GraphPanel(
     private fun paintEdges(g2: Graphics2D) {
         val edgeColor = JBColor(Color(0x6B6B6B), Color(0xB3B3B3))
         val labelBg = JBColor.background()
-        val fm = g2.getFontMetrics(g2.font)
+        g2.font = GraphMetrics.subFont
+        val fm = g2.getFontMetrics(GraphMetrics.subFont)
 
         g2.color = edgeColor
         g2.stroke = BasicStroke(1.4f)
@@ -146,23 +147,24 @@ class GraphPanel(
 
             edge.condition?.let { cond ->
                 val mid = midpoint(edge.points)
-                val text = cond
-                val tw = fm.stringWidth(text).toDouble()
+                val tw = fm.stringWidth(cond).toDouble()
                 val th = fm.height.toDouble()
-                val padX = 4.0
-                val padY = 2.0
+                val padX = 6.0
+                val padY = 3.0
                 val rx = mid.x - tw / 2 - padX
                 val ry = mid.y - th / 2 - padY
                 g2.color = labelBg
-                g2.fillRoundRect(rx.toInt(), ry.toInt(), (tw + 2 * padX).toInt(), (th + 2 * padY).toInt(), 6, 6)
+                g2.fillRoundRect(rx.toInt(), ry.toInt(), (tw + 2 * padX).toInt(), (th + 2 * padY).toInt(), 8, 8)
                 g2.color = edgeColor
-                g2.drawString(text, (mid.x - tw / 2).toFloat(), (mid.y + fm.ascent / 2.0 - 2).toFloat())
+                g2.drawString(cond, (mid.x - tw / 2).toFloat(), (mid.y + fm.ascent / 2.0 - 2).toFloat())
             }
         }
     }
 
     private fun paintNodes(g2: Graphics2D) {
-        val fm = g2.getFontMetrics(g2.font)
+        val mainFm = g2.getFontMetrics(GraphMetrics.mainFont)
+        val subFm = g2.getFontMetrics(GraphMetrics.subFont)
+
         graph.nodes.forEach { node ->
             val b = node.bounds
             val shape = RoundRectangle2D.Double(b.x, b.y, b.width, b.height, 14.0, 14.0)
@@ -175,21 +177,31 @@ class GraphPanel(
 
             val id = node.model.id
             val factory = node.model.factory
-            val idW = fm.stringWidth(id)
             val xCenter = b.x + b.width / 2.0
 
             g2.color = JBColor.foreground()
             if (factory != null) {
-                val idY = b.y + b.height / 2.0 - 2.0
-                val facY = b.y + b.height / 2.0 + fm.height - 4.0
-                g2.drawString(id, (xCenter - idW / 2).toFloat(), idY.toFloat())
+                val mainH = mainFm.ascent + mainFm.descent.toDouble()
+                val subH = subFm.ascent + subFm.descent.toDouble()
+                val totalH = mainH + GraphMetrics.LINE_GAP + subH
+                val topY = b.y + (b.height - totalH) / 2.0
+
+                g2.font = GraphMetrics.mainFont
+                val idW = mainFm.stringWidth(id)
+                val idBaseline = topY + mainFm.ascent
+                g2.drawString(id, (xCenter - idW / 2).toFloat(), idBaseline.toFloat())
+
                 val facText = "by $factory()"
-                val facW = fm.stringWidth(facText)
+                val facW = subFm.stringWidth(facText)
+                val facBaseline = idBaseline + mainFm.descent + GraphMetrics.LINE_GAP + subFm.ascent
+                g2.font = GraphMetrics.subFont
                 g2.color = JBColor(Color(0x7A7A7A), Color(0x9E9E9E))
-                g2.drawString(facText, (xCenter - facW / 2).toFloat(), facY.toFloat())
+                g2.drawString(facText, (xCenter - facW / 2).toFloat(), facBaseline.toFloat())
             } else {
-                val y = b.y + b.height / 2.0 + fm.ascent / 2.0 - 2.0
-                g2.drawString(id, (xCenter - idW / 2).toFloat(), y.toFloat())
+                g2.font = GraphMetrics.mainFont
+                val idW = mainFm.stringWidth(id)
+                val baseline = b.y + (b.height + mainFm.ascent - mainFm.descent) / 2.0
+                g2.drawString(id, (xCenter - idW / 2).toFloat(), baseline.toFloat())
             }
         }
     }

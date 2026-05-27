@@ -31,15 +31,15 @@ object ElkLayout {
         root.setProperty(CoreOptions.ALGORITHM, "org.eclipse.elk.layered")
         root.setProperty(CoreOptions.DIRECTION, Direction.DOWN)
         root.setProperty(CoreOptions.EDGE_ROUTING, EdgeRouting.ORTHOGONAL)
-        root.setProperty(CoreOptions.SPACING_NODE_NODE, 35.0)
-        root.setProperty(CoreOptions.SPACING_EDGE_NODE, 20.0)
-        root.setProperty(CoreOptions.SPACING_EDGE_EDGE, 15.0)
-        root.setProperty(CoreOptions.PADDING, org.eclipse.elk.core.math.ElkPadding(20.0))
+        root.setProperty(CoreOptions.SPACING_NODE_NODE, 60.0)
+        root.setProperty(CoreOptions.SPACING_EDGE_NODE, 35.0)
+        root.setProperty(CoreOptions.SPACING_EDGE_EDGE, 20.0)
+        root.setProperty(CoreOptions.PADDING, org.eclipse.elk.core.math.ElkPadding(32.0))
 
         val elkNodes = graph.nodes.associate { node ->
             val n = ElkGraphUtil.createNode(root)
             n.identifier = node.id
-            val (w, h) = estimateSize(node.id, node.factory)
+            val (w, h) = GraphMetrics.nodeSize(node.id, node.factory)
             n.width = w
             n.height = h
             node.id to n
@@ -87,15 +87,5 @@ object ElkLayout {
             width = root.width,
             height = root.height,
         )
-    }
-
-    /** Rough text-based size estimate; the Swing painter uses the same metric. */
-    private fun estimateSize(label: String, factory: String?): Pair<Double, Double> {
-        val main = label.length
-        val sub = factory?.length ?: 0
-        val charW = 7.0
-        val width = maxOf(main, sub) * charW + 28.0
-        val height = if (factory != null) 44.0 else 32.0
-        return width.coerceAtLeast(110.0) to height
     }
 }
