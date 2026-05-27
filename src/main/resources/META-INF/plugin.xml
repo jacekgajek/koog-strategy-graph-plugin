@@ -1,8 +1,6 @@
 <idea-plugin>
     <id>io.github.jacekgajek.koog-strategy-graph</id>
     <name>Koog Strategy Graph</name>
-    <!-- TODO before publishing: set a real contact email here. The Marketplace
-         enforces a deliverable address; the placeholder will be rejected. -->
     <vendor email="jacek.s.gajek@gmail.com" url="https://github.com/jacekgajek">Jacek Gajek</vendor>
 
     <description><![CDATA[
