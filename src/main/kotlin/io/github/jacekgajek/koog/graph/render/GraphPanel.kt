@@ -143,9 +143,17 @@ class GraphPanel(
         })
         addMouseWheelListener { e: MouseWheelEvent ->
             val factor = if (e.preciseWheelRotation < 0) 1.1 else 1 / 1.1
+            val newScale = (scale * factor).coerceIn(0.2, 4.0)
+            if (newScale == scale) return@addMouseWheelListener
+
+            // Capture the graph-coord point under the cursor at the CURRENT scale,
+            // then adjust pan so the same graph point lands at the same cursor
+            // position after the scale change — i.e., zoom pivots on the cursor.
+            val pivot = toGraph(e.point)
             fitMode = false
-            scale = (scale * factor).coerceIn(0.2, 4.0)
-            revalidate()
+            scale = newScale
+            panX = e.x - pivot.x * scale - (width - graph.width * scale) / 2
+            panY = e.y - pivot.y * scale - (height - graph.height * scale) / 2
             repaint()
         }
     }
