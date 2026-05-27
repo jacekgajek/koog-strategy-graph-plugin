@@ -1,4 +1,5 @@
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+import org.jetbrains.intellij.platform.gradle.tasks.VerifyPluginTask.FailureLevel
 
 plugins {
     kotlin("jvm") version "2.3.21"
@@ -42,6 +43,22 @@ intellijPlatform {
             sinceBuild = "242"
             untilBuild = provider { null }
         }
+    }
+    pluginVerification {
+        // Default failureLevel includes INTERNAL_API_USAGES which fires on Kotlin
+        // bridge methods generated for every default method of any Kotlin interface
+        // we implement (e.g. ToolWindowFactory.getAnchor/getIcon/manage/...). We
+        // never wrote those overrides; the compiler did. Keep only the categories
+        // that actually indicate a breaking change.
+        failureLevel.set(
+            listOf(
+                FailureLevel.COMPATIBILITY_PROBLEMS,
+                FailureLevel.SCHEDULED_FOR_REMOVAL_API_USAGES,
+                FailureLevel.MISSING_DEPENDENCIES,
+                FailureLevel.INVALID_PLUGIN,
+                FailureLevel.PLUGIN_STRUCTURE_WARNINGS,
+            )
+        )
     }
     publishing {
         // Token: https://plugins.jetbrains.com/author/me/tokens

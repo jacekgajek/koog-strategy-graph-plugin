@@ -1,6 +1,6 @@
 package io.github.jacekgajek.koog.graph.tool
 
-import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.wm.ToolWindow
@@ -17,7 +17,7 @@ import javax.swing.SwingConstants
 class KoogGraphService(private val project: Project) {
 
     fun showGraph(call: KtCallExpression) {
-        val graph = ReadAction.compute<_, RuntimeException> { StrategyParser().parse(call) } ?: return
+        val graph = runReadAction { StrategyParser().parse(call) } ?: return
         val laidOut = ElkLayout.layout(graph)
         val panel = GraphPanel(laidOut, project)
 
