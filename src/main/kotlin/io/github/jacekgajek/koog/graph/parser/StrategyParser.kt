@@ -100,7 +100,10 @@ class StrategyParser {
         val callee = call.calleeExpression as? KtNameReferenceExpression ?: return
         if (callee.getReferencedName() != "edge") return
         val arg = call.valueArguments.firstOrNull()?.getArgumentExpression() ?: return
-        val edge = extractEdge(arg) ?: return
+        val anchor = call.containingFile.virtualFile?.let { vf ->
+            SourceAnchor(vf, call.textRange.startOffset)
+        }
+        val edge = extractEdge(arg, anchor) ?: return
         sink += edge
     }
 
@@ -112,7 +115,7 @@ class StrategyParser {
      * so the structure is:
      *   ((from forwardTo to) onCondition { ... })
      */
-    private fun extractEdge(expr: KtExpression): Edge? {
+    private fun extractEdge(expr: KtExpression, anchor: SourceAnchor?): Edge? {
         var current: KtExpression = expr
         var condition: String? = null
         var conditionExpr: String? = null
@@ -121,7 +124,7 @@ class StrategyParser {
             if (op == "forwardTo") {
                 val from = nameOf(current.left) ?: return null
                 val to = nameOf(current.right) ?: return null
-                return Edge(from, to, condition, conditionExpr)
+                return Edge(from, to, condition, conditionExpr, anchor)
             }
             // This is a condition wrapping (e.g. `onToolCalls { true }`).
             condition = op

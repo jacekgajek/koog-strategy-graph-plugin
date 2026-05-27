@@ -1,8 +1,8 @@
 package io.github.jacekgajek.koog.graph.render
 
-import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
+import io.github.jacekgajek.koog.graph.parser.SourceAnchor
 import com.intellij.ui.JBColor
 import com.intellij.ui.scale.JBUIScale
 import io.github.jacekgajek.koog.graph.parser.NodeKind
@@ -50,9 +50,16 @@ class GraphPanel(
 
         addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                if (e.clickCount < 2) return
-                val node = nodeAt(e.point) ?: return
-                navigateTo(node)
+                if (e.clickCount != 1) return
+                val node = nodeAt(e.point)
+                if (node != null) {
+                    navigateTo(node.model.anchor)
+                    return
+                }
+                val edge = edgeAt(e.point)
+                if (edge != null) {
+                    navigateTo(edge.anchor)
+                }
             }
 
             override fun mouseExited(e: MouseEvent) {
@@ -244,8 +251,8 @@ class GraphPanel(
         return if (hovered) base.first.brighter() to base.second.brighter() else base
     }
 
-    private fun navigateTo(node: LaidOutNode) {
-        val anchor = node.model.anchor ?: return
+    private fun navigateTo(anchor: SourceAnchor?) {
+        anchor ?: return
         OpenFileDescriptor(project, anchor.file, anchor.offset).navigate(true)
     }
 

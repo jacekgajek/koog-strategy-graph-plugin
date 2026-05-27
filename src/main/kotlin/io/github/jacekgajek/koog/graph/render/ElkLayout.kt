@@ -85,6 +85,7 @@ object ElkLayout {
                 condition = edge.condition,
                 conditionExpr = edge.conditionExpr,
                 points = points,
+                anchor = edge.anchor,
             )
         }
 

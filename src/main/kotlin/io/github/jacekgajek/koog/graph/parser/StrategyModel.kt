@@ -44,6 +44,8 @@ data class Edge(
     val condition: String?,
     /** Verbatim source of the condition lambda, for tooltips. */
     val conditionExpr: String?,
+    /** Where in the source the `edge(...)` call lives. */
+    val anchor: SourceAnchor?,
 )
 
 /** Lightweight pointer back to source; safe to hold across PSI invalidations. */

@@ -25,10 +25,10 @@ object GraphMetrics {
 
     private val frc = FontRenderContext(null, true, true)
 
-    val padX: Double get() = JBUIScale.scale(20f).toDouble()
-    val padY: Double get() = JBUIScale.scale(12f).toDouble()
-    val lineGap: Double get() = JBUIScale.scale(4f).toDouble()
-    val minWidth: Double get() = JBUIScale.scale(160f).toDouble()
+    val padX: Double get() = JBUIScale.scale(14f).toDouble()
+    val padY: Double get() = JBUIScale.scale(8f).toDouble()
+    val lineGap: Double get() = JBUIScale.scale(3f).toDouble()
+    val minWidth: Double get() = JBUIScale.scale(140f).toDouble()
 
     fun textWidth(font: Font, text: String): Double =
         font.getStringBounds(text, frc).width
