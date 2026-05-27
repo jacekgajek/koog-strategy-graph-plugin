@@ -31,8 +31,14 @@ class GraphPanel(
 
     private var scale: Double = 1.0
     private var fitMode: Boolean = true
+    private var panX: Double = 0.0
+    private var panY: Double = 0.0
     private var hovered: LaidOutNode? = null
     private var hoveredEdge: LaidOutEdge? = null
+
+    private var dragPrev: java.awt.Point? = null
+    private var didDrag: Boolean = false
+    private val dragThresholdPx: Int = JBUIScale.scale(4)
 
     private data class TooltipLine(val text: String, val bold: Boolean)
     private var tooltipLines: List<TooltipLine> = emptyList()
@@ -57,8 +63,22 @@ class GraphPanel(
         })
 
         addMouseListener(object : MouseAdapter() {
+            override fun mousePressed(e: MouseEvent) {
+                dragPrev = e.point
+                didDrag = false
+            }
+
+            override fun mouseReleased(e: MouseEvent) {
+                dragPrev = null
+                if (!didDrag) {
+                    cursor = if (nodeAt(e.point) != null || edgeAt(e.point) != null) {
+                        Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                    } else Cursor.getDefaultCursor()
+                }
+            }
+
             override fun mouseClicked(e: MouseEvent) {
-                if (e.clickCount != 1) return
+                if (e.clickCount != 1 || didDrag) return
                 val node = nodeAt(e.point)
                 if (node != null) {
                     navigateTo(node.model.anchor)
@@ -82,6 +102,25 @@ class GraphPanel(
             }
         })
         addMouseMotionListener(object : MouseAdapter() {
+            override fun mouseDragged(e: MouseEvent) {
+                val prev = dragPrev ?: return
+                val dx = e.x - prev.x
+                val dy = e.y - prev.y
+                if (!didDrag && Math.abs(dx) + Math.abs(dy) < dragThresholdPx) return
+                didDrag = true
+                fitMode = false
+                panX += dx
+                panY += dy
+                dragPrev = e.point
+                cursor = Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR)
+                // Drop hover state during pan so we don't flicker tooltips/highlights.
+                hovered = null
+                hoveredEdge = null
+                tooltipLines = emptyList()
+                tooltipAnchor = null
+                repaint()
+            }
+
             override fun mouseMoved(e: MouseEvent) {
                 val n = nodeAt(e.point)
                 val edge = if (n == null) edgeAt(e.point) else null
@@ -111,9 +150,11 @@ class GraphPanel(
         }
     }
 
-    /** Re-enable auto-fit; the next paint recomputes scale from current size. */
+    /** Re-enable auto-fit and re-center; the next paint recomputes scale from current size. */
     fun fitToWindow() {
         fitMode = true
+        panX = 0.0
+        panY = 0.0
         repaint()
     }
 
@@ -157,9 +198,8 @@ class GraphPanel(
     }
 
     private fun origin(): Pair<Double, Double> {
-        val pad = JBUIScale.scale(20f).toDouble()
-        val ox = ((width - graph.width * scale) / 2).coerceAtLeast(pad)
-        val oy = pad
+        val ox = (width - graph.width * scale) / 2 + panX
+        val oy = (height - graph.height * scale) / 2 + panY
         return ox to oy
     }
 
