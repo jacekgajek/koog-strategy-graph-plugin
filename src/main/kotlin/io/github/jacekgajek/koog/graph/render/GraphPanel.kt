@@ -23,7 +23,6 @@ import java.awt.geom.Path2D
 import java.awt.geom.Point2D
 import java.awt.geom.RoundRectangle2D
 import javax.swing.JPanel
-import javax.swing.ToolTipManager
 
 class GraphPanel(
     private val graph: LaidOutGraph,
@@ -35,28 +34,9 @@ class GraphPanel(
     private var hovered: LaidOutNode? = null
     private var hoveredEdge: LaidOutEdge? = null
 
-    private var savedInitialDelay: Int = ToolTipManager.sharedInstance().initialDelay
-    private var savedReshowDelay: Int = ToolTipManager.sharedInstance().reshowDelay
-    private var savedDismissDelay: Int = ToolTipManager.sharedInstance().dismissDelay
-
-    override fun addNotify() {
-        super.addNotify()
-        val mgr = ToolTipManager.sharedInstance()
-        savedInitialDelay = mgr.initialDelay
-        savedReshowDelay = mgr.reshowDelay
-        savedDismissDelay = mgr.dismissDelay
-        mgr.initialDelay = 0
-        mgr.reshowDelay = 0
-        mgr.dismissDelay = 60_000
-    }
-
-    override fun removeNotify() {
-        val mgr = ToolTipManager.sharedInstance()
-        mgr.initialDelay = savedInitialDelay
-        mgr.reshowDelay = savedReshowDelay
-        mgr.dismissDelay = savedDismissDelay
-        super.removeNotify()
-    }
+    private data class TooltipLine(val text: String, val bold: Boolean)
+    private var tooltipLines: List<TooltipLine> = emptyList()
+    private var tooltipAnchor: java.awt.Point? = null
 
     init {
         background = JBColor.background()
@@ -66,7 +46,9 @@ class GraphPanel(
             (graph.width * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(480)),
             (graph.height * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(360)),
         )
-        toolTipText = ""
+        // We render our own tooltip in paintComponent — Swing's ToolTipText is
+        // intercepted by IntelliJ's IdeTooltipManager, which has its own delay
+        // we can't reliably override per-component, so we draw it ourselves.
 
         addComponentListener(object : ComponentAdapter() {
             override fun componentResized(e: ComponentEvent) {
@@ -89,9 +71,11 @@ class GraphPanel(
             }
 
             override fun mouseExited(e: MouseEvent) {
-                if (hovered != null || hoveredEdge != null) {
+                if (hovered != null || hoveredEdge != null || tooltipLines.isNotEmpty()) {
                     hovered = null
                     hoveredEdge = null
+                    tooltipLines = emptyList()
+                    tooltipAnchor = null
                     cursor = Cursor.getDefaultCursor()
                     repaint()
                 }
@@ -101,9 +85,15 @@ class GraphPanel(
             override fun mouseMoved(e: MouseEvent) {
                 val n = nodeAt(e.point)
                 val edge = if (n == null) edgeAt(e.point) else null
-                val changed = n !== hovered || edge !== hoveredEdge
+                val newLines = buildTooltip(n, edge)
+                val changed = n !== hovered ||
+                    edge !== hoveredEdge ||
+                    newLines != tooltipLines ||
+                    (newLines.isNotEmpty() && tooltipAnchor != e.point)
                 hovered = n
                 hoveredEdge = edge
+                tooltipLines = newLines
+                tooltipAnchor = if (newLines.isNotEmpty()) e.point else null
                 cursor = if (n != null || edge != null) {
                     Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
                 } else {
@@ -135,18 +125,20 @@ class GraphPanel(
         scale = minOf(availW / graph.width, availH / graph.height).coerceIn(0.2, 4.0)
     }
 
-    override fun getToolTipText(e: MouseEvent): String? {
-        val node = nodeAt(e.point)
+    private fun buildTooltip(node: LaidOutNode?, edge: LaidOutEdge?): List<TooltipLine> {
         if (node != null) {
-            val parts = mutableListOf("<b>${node.model.id}</b>")
-            node.model.factory?.let { parts += "by $it()" }
-            return "<html>${parts.joinToString("<br/>")}</html>"
+            val out = mutableListOf(TooltipLine(node.model.id, bold = true))
+            node.model.factory?.let { out += TooltipLine("by $it()", bold = false) }
+            return out
         }
-        val edge = edgeAt(e.point)
         if (edge != null && edge.condition != null) {
-            return "<html><b>${edge.condition}</b> ${edge.conditionExpr.orEmpty()}</html>"
+            val out = mutableListOf(TooltipLine(edge.condition, bold = true))
+            edge.conditionExpr?.takeIf { it.isNotBlank() }?.let {
+                out += TooltipLine(it, bold = false)
+            }
+            return out
         }
-        return null
+        return emptyList()
     }
 
     private fun nodeAt(p: java.awt.Point): LaidOutNode? {
@@ -190,6 +182,52 @@ class GraphPanel(
         paintNodes(g2)
 
         g2.transform = original
+        paintTooltip(g2)
+    }
+
+    private fun paintTooltip(g2: Graphics2D) {
+        val anchor = tooltipAnchor ?: return
+        if (tooltipLines.isEmpty()) return
+
+        val mainFm = g2.getFontMetrics(GraphMetrics.mainFont.deriveFont(java.awt.Font.BOLD))
+        val subFm = g2.getFontMetrics(GraphMetrics.mainFont)
+        val padX = JBUIScale.scale(8)
+        val padY = JBUIScale.scale(6)
+        val lineGap = JBUIScale.scale(2)
+
+        val widths = tooltipLines.map { line ->
+            (if (line.bold) mainFm else subFm).stringWidth(line.text)
+        }
+        val tw = (widths.maxOrNull() ?: 0) + 2 * padX
+        val lineH = tooltipLines.map { if (it.bold) mainFm.height else subFm.height }
+        val th = lineH.sum() + (tooltipLines.size - 1) * lineGap + 2 * padY
+
+        // Position to the bottom-right of cursor; nudge inside panel.
+        val offset = JBUIScale.scale(16)
+        var x = anchor.x + offset
+        var y = anchor.y + offset
+        if (x + tw > width) x = (anchor.x - tw - offset).coerceAtLeast(0)
+        if (y + th > height) y = (anchor.y - th - offset).coerceAtLeast(0)
+
+        val bg = JBColor(Color(0xFFFFE1), Color(0x3B3F45))
+        val border = JBColor(Color(0xC0C0C0), Color(0x5A5F66))
+        val fg = JBColor.foreground()
+
+        g2.color = bg
+        g2.fillRoundRect(x, y, tw, th, 8, 8)
+        g2.color = border
+        g2.stroke = BasicStroke(1f)
+        g2.drawRoundRect(x, y, tw, th, 8, 8)
+
+        var lineTop = y + padY
+        g2.color = fg
+        tooltipLines.forEachIndexed { i, line ->
+            val fm = if (line.bold) mainFm else subFm
+            g2.font = if (line.bold) GraphMetrics.mainFont.deriveFont(java.awt.Font.BOLD)
+                      else GraphMetrics.mainFont
+            g2.drawString(line.text, x + padX, lineTop + fm.ascent)
+            lineTop += fm.height + lineGap
+        }
     }
 
     private fun paintEdges(g2: Graphics2D) {
