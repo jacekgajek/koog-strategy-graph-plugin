@@ -23,6 +23,7 @@ import java.awt.geom.Path2D
 import java.awt.geom.Point2D
 import java.awt.geom.RoundRectangle2D
 import javax.swing.JPanel
+import javax.swing.ToolTipManager
 
 class GraphPanel(
     private val graph: LaidOutGraph,
@@ -33,6 +34,29 @@ class GraphPanel(
     private var fitMode: Boolean = true
     private var hovered: LaidOutNode? = null
     private var hoveredEdge: LaidOutEdge? = null
+
+    private var savedInitialDelay: Int = ToolTipManager.sharedInstance().initialDelay
+    private var savedReshowDelay: Int = ToolTipManager.sharedInstance().reshowDelay
+    private var savedDismissDelay: Int = ToolTipManager.sharedInstance().dismissDelay
+
+    override fun addNotify() {
+        super.addNotify()
+        val mgr = ToolTipManager.sharedInstance()
+        savedInitialDelay = mgr.initialDelay
+        savedReshowDelay = mgr.reshowDelay
+        savedDismissDelay = mgr.dismissDelay
+        mgr.initialDelay = 0
+        mgr.reshowDelay = 0
+        mgr.dismissDelay = 60_000
+    }
+
+    override fun removeNotify() {
+        val mgr = ToolTipManager.sharedInstance()
+        mgr.initialDelay = savedInitialDelay
+        mgr.reshowDelay = savedReshowDelay
+        mgr.dismissDelay = savedDismissDelay
+        super.removeNotify()
+    }
 
     init {
         background = JBColor.background()
