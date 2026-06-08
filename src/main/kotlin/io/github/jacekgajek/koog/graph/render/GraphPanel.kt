@@ -25,9 +25,11 @@ import java.awt.geom.RoundRectangle2D
 import javax.swing.JPanel
 
 class GraphPanel(
-    private val graph: LaidOutGraph,
+    graph: LaidOutGraph,
     private val project: Project,
 ) : JPanel() {
+
+    private var graph: LaidOutGraph = graph
 
     private var scale: Double = 1.0
     private var fitMode: Boolean = true
@@ -47,11 +49,7 @@ class GraphPanel(
     init {
         background = JBColor.background()
         isFocusable = true
-        val margin = JBUIScale.scale(40)
-        preferredSize = Dimension(
-            (graph.width * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(480)),
-            (graph.height * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(360)),
-        )
+        updatePreferredSize()
         // We render our own tooltip in paintComponent — Swing's ToolTipText is
         // intercepted by IntelliJ's IdeTooltipManager, which has its own delay
         // we can't reliably override per-component, so we draw it ourselves.
@@ -156,6 +154,31 @@ class GraphPanel(
             panY = e.y - pivot.y * scale - (height - graph.height * scale) / 2
             repaint()
         }
+    }
+
+    /**
+     * Swap in a freshly parsed + laid-out graph (e.g. after the source changed),
+     * preserving the user's current zoom/pan so the view doesn't jump on every
+     * keystroke. Stale hover/tooltip state points at the old node/edge instances,
+     * so we drop it.
+     */
+    fun updateGraph(newGraph: LaidOutGraph) {
+        graph = newGraph
+        hovered = null
+        hoveredEdge = null
+        tooltipLines = emptyList()
+        tooltipAnchor = null
+        updatePreferredSize()
+        revalidate()
+        repaint()
+    }
+
+    private fun updatePreferredSize() {
+        val margin = JBUIScale.scale(40)
+        preferredSize = Dimension(
+            (graph.width * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(480)),
+            (graph.height * scale + margin).toInt().coerceAtLeast(JBUIScale.scale(360)),
+        )
     }
 
     /** Re-enable auto-fit and re-center; the next paint recomputes scale from current size. */
