@@ -19,6 +19,9 @@ import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.SmartPointerManager
 import com.intellij.psi.SmartPsiElementPointer
 import com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.kotlin.psi.KtBinaryExpression
+import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.content.Content
@@ -100,6 +103,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         content.isPinnable = true
         val tab = GraphTab(pointer, view, content)
         view.onNodeClick = tab::navigateToNode
+        view.onEdgeClick = tab::navigateToEdge
         tab.listenTo(file)
         tabs += tab
         return tab
@@ -269,6 +273,36 @@ class KoogGraphService(private val project: Project) : Disposable {
                 return
             }
             OpenFileDescriptor(project, target.first, target.second).navigate(true)
+        }
+
+        /**
+         * Navigate from a clicked edge to its `edge(from forwardTo to …)` definition.
+         * Koog edges are written with the `forwardTo` infix, so we look for the
+         * `from forwardTo to` expression whose operands name the clicked endpoints.
+         */
+        fun navigateToEdge(from: String, to: String) {
+            val target = runReadAction {
+                val call = pointer.element ?: return@runReadAction null
+                val binary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
+                    .firstOrNull {
+                        it.operationReference.getReferencedName() == "forwardTo" &&
+                            leadingName(it.left) == from && leadingName(it.right) == to
+                    } ?: return@runReadAction null
+                val vf = binary.containingFile?.virtualFile ?: return@runReadAction null
+                vf to binary.textOffset
+            }
+            if (target == null) {
+                LOG.info("navigateToEdge: no 'edge($from forwardTo $to)' found in the strategy")
+                return
+            }
+            OpenFileDescriptor(project, target.first, target.second).navigate(true)
+        }
+
+        /** The first (receiver-most) referenced name within an expression, or null. */
+        private fun leadingName(expr: KtExpression?): String? = when (expr) {
+            null -> null
+            is KtNameReferenceExpression -> expr.getReferencedName()
+            else -> PsiTreeUtil.findChildOfType(expr, KtNameReferenceExpression::class.java)?.getReferencedName()
         }
 
         fun listenTo(file: VirtualFile?) {

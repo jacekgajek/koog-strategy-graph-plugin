@@ -17,6 +17,19 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.2</h3>
+        <ul>
+            <li>Graphs are now rendered with Koog's own <code>MermaidDiagramGenerator</code>:
+                the <code>strategy { }</code> snippet is compiled against your module and run,
+                so the diagram always matches Koog's real interpretation.</li>
+            <li>Click a node to jump to its declaration, and click an edge (with a forgiving
+                hit area) to jump to its <code>edge(from forwardTo to)</code> definition.</li>
+            <li>The graph refreshes automatically as you edit, keeping the last valid diagram
+                while the code is incomplete.</li>
+            <li>Graph validation and compile errors are listed in a Problems-style panel
+                without discarding the current diagram.</li>
+            <li>Strategy tabs are pinnable and closable, like search results.</li>
+        </ul>
         <h3>0.1.0</h3>
         <ul>
             <li>Initial release: gutter icon + popup graph.</li>

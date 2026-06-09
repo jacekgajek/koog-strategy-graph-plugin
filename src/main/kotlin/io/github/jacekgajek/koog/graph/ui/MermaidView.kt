@@ -29,6 +29,9 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
     /** Invoked (on the EDT) with a node/subgraph id when the user clicks it in the diagram. */
     var onNodeClick: (String) -> Unit = {}
 
+    /** Invoked (on the EDT) with the from/to node ids when the user clicks an edge. */
+    var onEdgeClick: (from: String, to: String) -> Unit = { _, _ -> }
+
     private val jsQuery: JBCefJSQuery? = browser?.let { JBCefJSQuery.create(it as JBCefBrowserBase) }
 
     private val fallback = JTextArea().apply {
@@ -55,8 +58,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
             jsQuery?.let { q ->
                 Disposer.register(this, q)
                 q.addHandler { raw ->
-                    val id = raw?.trim().orEmpty()
-                    if (id.isNotEmpty()) ApplicationManager.getApplication().invokeLater { onNodeClick(id) }
+                    dispatch(raw)
                     null
                 }
             }
@@ -65,6 +67,22 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
             add(JScrollPane(fallback), BorderLayout.CENTER)
         }
         showMessage("Loading strategy graph…", "")
+    }
+
+    /** Decode a `kindarg…` message from the page and fire the matching callback on the EDT. */
+    private fun dispatch(raw: String?) {
+        val parts = raw.orEmpty().split('\u0001')
+        when (parts.getOrNull(0)) {
+            "node" -> parts.getOrNull(1)?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { id -> ApplicationManager.getApplication().invokeLater { onNodeClick(id) } }
+            "edge" -> {
+                val from = parts.getOrNull(1)?.trim().orEmpty()
+                val to = parts.getOrNull(2)?.trim().orEmpty()
+                if (from.isNotEmpty() && to.isNotEmpty()) {
+                    ApplicationManager.getApplication().invokeLater { onEdgeClick(from, to) }
+                }
+            }
+        }
     }
 
     fun showDiagram(mermaid: String) {
@@ -108,8 +126,35 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
         // Click → source navigation. Only wired when JCEF (and the query) is available.
         val clickJs = jsQuery?.let { q ->
             """
-                function __koogNodeClick(id) { ${q.inject("id")} }
-                function koogBindClicks() {
+                function __koogSend(msg) { ${q.inject("msg")} }
+                function __koogNodeClick(id) { __koogSend('node\u0001' + id); }
+                function __koogEdgeClick(f, t) { __koogSend('edge\u0001' + f + '\u0001' + t); }
+
+                // The Mermaid source survives in window.__koogSrc (captured before run()
+                // replaces the <pre>). edges[N] is the Nth edge in declaration order;
+                // Mermaid tags each rendered path with that same N in its id ("…-edgeN"),
+                // so we map a path to its endpoints by that index — NOT by DOM order,
+                // which the layout engine reshuffles (especially with subgraphs).
+                function koogEdges() {
+                  var out = [];
+                  (window.__koogSrc || '').split('\n').forEach(function (line) {
+                    var m = line.match(/^\s*([A-Za-z0-9_]+|\[\*\])\s*-->\s*([A-Za-z0-9_]+|\[\*\])(?:\s*:.*)?$/);
+                    if (m) out.push([m[1], m[2]]);
+                  });
+                  return out;
+                }
+                function koogEdgeIndex(p) {
+                  var m = (p.getAttribute('id') || '').match(/edge(\d+)$/);
+                  return m ? parseInt(m[1], 10) : -1;
+                }
+                // [*] is Mermaid's start/finish marker: it's the start node on the left
+                // of an edge and the finish node on the right. Koog writes those as the
+                // nodeStart / nodeFinish builder properties.
+                function koogEndpoint(tok, isSource) {
+                  return tok === '[*]' ? (isSource ? 'nodeStart' : 'nodeFinish') : tok;
+                }
+
+                function koogBindNodes() {
                   document.querySelectorAll('g.node').forEach(function (n) {
                     n.addEventListener('click', function () {
                       var l = n.querySelector('.nodeLabel, text');
@@ -128,6 +173,43 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                     });
                   });
                 }
+
+                function koogBindEdges() {
+                  var edges = koogEdges();
+                  var paths = document.querySelectorAll('g.edgePaths > path');
+                  if (!paths.length) paths = document.querySelectorAll('path.transition');
+                  paths.forEach(function (p, i) {
+                    var n = koogEdgeIndex(p);
+                    var e = (n >= 0 ? edges[n] : null) || edges[i];
+                    if (!e) return;
+                    var from = koogEndpoint(e[0], true), to = koogEndpoint(e[1], false);
+                    // A wide, invisible companion path so the user needn't hit the
+                    // thin stroke pixel-perfectly. It carries the click; hovering it
+                    // highlights the real edge underneath.
+                    var hit = p.cloneNode(false);
+                    hit.removeAttribute('marker-end');
+                    hit.removeAttribute('marker-start');
+                    hit.removeAttribute('id');
+                    hit.style.stroke = 'transparent';
+                    hit.style.strokeWidth = '14px';
+                    hit.style.fill = 'none';
+                    hit.style.pointerEvents = 'stroke';
+                    hit.style.cursor = 'pointer';
+                    hit.addEventListener('click', function () { __koogEdgeClick(from, to); });
+                    hit.addEventListener('mouseenter', function () {
+                      p.dataset.koogSw = p.style.strokeWidth || '';
+                      p.style.strokeWidth = '3px';
+                      p.style.filter = 'brightness(1.6)';
+                    });
+                    hit.addEventListener('mouseleave', function () {
+                      p.style.strokeWidth = p.dataset.koogSw || '';
+                      p.style.filter = '';
+                    });
+                    p.parentNode.insertBefore(hit, p.nextSibling);
+                  });
+                }
+
+                function koogBindClicks() { koogBindNodes(); koogBindEdges(); }
             """.trimIndent()
         } ?: "function koogBindClicks() {}"
 
@@ -145,6 +227,9 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 g.node { cursor: pointer; }
                 g.node:hover * { filter: brightness(1.18); }
                 g.cluster > .cluster-label:hover, g.cluster text:hover { text-decoration: underline; }
+                g.edgePaths path { cursor: pointer; }
+                /* Let clicks on a condition label fall through to the edge beneath it. */
+                g.edgeLabels { pointer-events: none; }
                 .msg h3 { margin: 0 0 8px; font-weight: 600; }
                 .msg .detail { white-space: pre-wrap; color: #c0392b; font-family: monospace;
                   font-size: 12px; }
@@ -155,6 +240,8 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
               <script src="mermaid.min.js"></script>
               <script>
                 $clickJs
+                // Stash the raw diagram text before mermaid.run() swaps in the SVG.
+                window.__koogSrc = (document.querySelector('.mermaid') || {}).textContent || '';
                 try {
                   mermaid.initialize({ startOnLoad: false, theme: '$theme', securityLevel: 'loose' });
                   mermaid.run().then(koogBindClicks).catch(function (e) {

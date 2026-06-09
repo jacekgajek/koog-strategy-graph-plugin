@@ -59,6 +59,11 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
         get() = view.onNodeClick
         set(value) { view.onNodeClick = value }
 
+    /** Called (on the EDT) with the from/to node ids when the user clicks an edge. */
+    var onEdgeClick: (from: String, to: String) -> Unit
+        get() = view.onEdgeClick
+        set(value) { view.onEdgeClick = value }
+
     fun showDiagram(mermaid: String) = view.showDiagram(mermaid)
 
     fun showMessage(title: String, detail: String) = view.showMessage(title, detail)
