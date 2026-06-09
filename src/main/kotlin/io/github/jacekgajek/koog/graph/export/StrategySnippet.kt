@@ -25,6 +25,8 @@ data class StrategySnippet(
 
         const val BEGIN_MARKER = "<<<KOOG-MERMAID-BEGIN>>>"
         const val END_MARKER = "<<<KOOG-MERMAID-END>>>"
+        const val ERROR_BEGIN_MARKER = "<<<KOOG-MERMAID-ERROR-BEGIN>>>"
+        const val ERROR_END_MARKER = "<<<KOOG-MERMAID-ERROR-END>>>"
 
         /** Stable name of the generated file / main class (MainKt). */
         const val FILE_NAME = "KoogStrategyMermaidMain.kt"
@@ -61,9 +63,20 @@ data class StrategySnippet(
             if (captures.isNotEmpty()) sb.appendLine()
             sb.appendLine("private val __koogStrategy = $strategyExpr")
             sb.appendLine()
+            // generate() validates the graph and may throw (e.g. unreachable finish
+            // node). Build the diagram first so a throw produces ONLY an error block,
+            // never a half-printed diagram; the plugin distinguishes the two by markers.
             sb.appendLine("fun main() {")
+            sb.appendLine("    val __diagram = try {")
+            sb.appendLine("        MermaidDiagramGenerator.generate(__koogStrategy)")
+            sb.appendLine("    } catch (t: Throwable) {")
+            sb.appendLine("        println(\"$ERROR_BEGIN_MARKER\")")
+            sb.appendLine("        println((t::class.qualifiedName ?: t::class.java.name) + \": \" + (t.message ?: \"\"))")
+            sb.appendLine("        println(\"$ERROR_END_MARKER\")")
+            sb.appendLine("        return")
+            sb.appendLine("    }")
             sb.appendLine("    println(\"$BEGIN_MARKER\")")
-            sb.appendLine("    print(MermaidDiagramGenerator.generate(__koogStrategy))")
+            sb.appendLine("    print(__diagram)")
             sb.appendLine("    println()")
             sb.appendLine("    println(\"$END_MARKER\")")
             sb.appendLine("}")

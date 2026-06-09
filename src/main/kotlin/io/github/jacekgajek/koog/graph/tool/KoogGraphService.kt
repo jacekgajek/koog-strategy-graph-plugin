@@ -25,7 +25,7 @@ import com.intellij.ui.content.ContentManagerListener
 import com.intellij.ui.content.ContentFactory
 import com.intellij.util.Alarm
 import io.github.jacekgajek.koog.graph.export.MermaidExporter
-import io.github.jacekgajek.koog.graph.ui.MermaidView
+import io.github.jacekgajek.koog.graph.ui.StrategyDiagramPanel
 import org.jetbrains.kotlin.psi.KtCallExpression
 import javax.swing.SwingConstants
 
@@ -38,6 +38,15 @@ class KoogGraphService(private val project: Project) : Disposable {
     /** The "click a gutter icon…" hint shown while no graph is open. */
     private var placeholder: Content? = null
     private var contentListenerInstalled = false
+
+    /**
+     * Memoizes outcomes by generated-source text. The snippet fully determines the
+     * diagram, so an unchanged strategy re-renders instantly (no compile/run). LRU-
+     * bounded; accessed only on the EDT.
+     */
+    private val cache = object : LinkedHashMap<String, MermaidExporter.ExportOutcome>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, MermaidExporter.ExportOutcome>) = size > CACHE_SIZE
+    }
 
     fun showGraph(call: KtCallExpression) {
         val ctx = runReadAction {
@@ -82,7 +91,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         pointer: SmartPsiElementPointer<KtCallExpression>,
         file: VirtualFile?,
     ): GraphTab {
-        val view = MermaidView()
+        val view = StrategyDiagramPanel()
         val content = ContentFactory.getInstance().createContent(view, "Koog graph", false)
         content.isCloseable = true
         content.isPinnable = true
@@ -145,10 +154,10 @@ class KoogGraphService(private val project: Project) : Disposable {
         tabs.clear()
     }
 
-    /** Per-tab state: the displayed strategy, its Mermaid view, and an edit listener. */
+    /** Per-tab state: the displayed strategy, its diagram view, and an edit listener. */
     private inner class GraphTab(
         private var pointer: SmartPsiElementPointer<KtCallExpression>,
-        private val view: MermaidView,
+        private val view: StrategyDiagramPanel,
         val content: Content,
     ) {
         private var document: Document? = null
@@ -169,15 +178,15 @@ class KoogGraphService(private val project: Project) : Disposable {
         }
 
         /**
-         * Recompile + run the strategy and show its diagram. The compile/run happens
-         * off the EDT. While the source is mid-edit and doesn't compile we keep the
-         * last good diagram (only the very first failure, with nothing to preserve,
-         * is shown as an error) — so the graph doesn't blank out between valid states.
+         * Recompile + run the strategy and show its diagram. Unchanged strategies are
+         * served instantly from [cache]. The compile/run happens off the EDT. When the
+         * code doesn't compile or the graph is invalid we keep the last good diagram
+         * and surface the problems in the table — so the graph never blanks out
+         * between valid states.
          */
         fun render() {
             val gen = ++generation
             LOG.info("render: starting generation #$gen (hasDiagram=$hasDiagram)")
-            if (!hasDiagram) view.showMessage("Generating diagram…", "")
 
             // Make PSI reflect the latest keystrokes before we lift the snippet.
             document?.let { doc ->
@@ -196,32 +205,45 @@ class KoogGraphService(private val project: Project) : Disposable {
                 return
             }
 
+            cache[prepared.source]?.let { cached ->
+                LOG.info("render #$gen: cache hit for '${cached.name}'")
+                apply(cached)
+                return
+            }
+
+            if (!hasDiagram) view.showMessage("Generating diagram…", "")
             ApplicationManager.getApplication().executeOnPooledThread {
                 // Guard everything: an exception here must never leave the view stuck on "Generating…".
-                val result = try {
+                val outcome = try {
                     MermaidExporter.run(prepared)
                 } catch (t: Throwable) {
                     LOG.warn("render #$gen: export threw", t)
-                    MermaidExporter.ExportResult.Failure("Diagram generation failed", t.toString())
+                    MermaidExporter.ExportOutcome(prepared.name, null, listOf(MermaidExporter.Problem("Diagram generation failed", t.toString())), cacheable = false)
                 }
                 ApplicationManager.getApplication().invokeLater {
                     if (project.isDisposed || gen != generation) {
                         LOG.info("render #$gen: result discarded (stale=${gen != generation}, disposed=${project.isDisposed})")
                         return@invokeLater
                     }
-                    when (result) {
-                        is MermaidExporter.ExportResult.Success -> {
-                            LOG.info("render #$gen: success, showing diagram for '${result.name}'")
-                            view.showDiagram(result.mermaid)
-                            content.displayName = result.name
-                            hasDiagram = true
-                        }
-                        is MermaidExporter.ExportResult.Failure -> {
-                            LOG.info("render #$gen: failure '${result.message}' (hasDiagram=$hasDiagram)")
-                            if (!hasDiagram) view.showMessage(result.message, result.detail)
-                        }
-                    }
+                    if (outcome.cacheable) cache[prepared.source] = outcome
+                    apply(outcome)
                 }
+            }
+        }
+
+        /** Apply an outcome to the view: update the diagram if present, always set problems. */
+        private fun apply(outcome: MermaidExporter.ExportOutcome) {
+            if (outcome.mermaid != null) {
+                view.showDiagram(outcome.mermaid)
+                content.displayName = outcome.name
+                hasDiagram = true
+                view.setProblems(emptyList())
+            } else {
+                if (!hasDiagram) {
+                    val first = outcome.problems.firstOrNull()
+                    view.showMessage(first?.message ?: "No diagram", first?.detail ?: "")
+                }
+                view.setProblems(outcome.problems)
             }
         }
 
@@ -243,6 +265,9 @@ class KoogGraphService(private val project: Project) : Disposable {
     companion object {
         private val LOG = logger<KoogGraphService>()
         const val TOOL_WINDOW_ID = "Koog Strategy"
-        private const val REFRESH_DELAY_MS = 600
+
+        // Each edit triggers a recompile; wait longer than a single keystroke burst.
+        private const val REFRESH_DELAY_MS = 1500
+        private const val CACHE_SIZE = 64
     }
 }

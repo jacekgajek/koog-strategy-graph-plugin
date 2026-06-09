@@ -50,10 +50,22 @@ object MermaidExporter {
         val javaExe: String,
     )
 
-    sealed interface ExportResult {
-        data class Success(val name: String, val mermaid: String) : ExportResult
-        data class Failure(val message: String, val detail: String) : ExportResult
-    }
+    /** A single row for the Problems-style table. */
+    data class Problem(val message: String, val detail: String? = null)
+
+    /**
+     * Result of an export. [mermaid] is non-null only when a diagram was produced;
+     * otherwise [problems] explains why (graph validation error, compile error, …)
+     * and the caller keeps the previously shown diagram. [cacheable] is false for
+     * transient/infrastructure outcomes (timeouts, missing compiler) that shouldn't
+     * be memoized.
+     */
+    class ExportOutcome(
+        val name: String,
+        val mermaid: String?,
+        val problems: List<Problem>,
+        val cacheable: Boolean = true,
+    )
 
     /** Build the runner + collect the module classpath. Call inside a read action. */
     fun prepare(call: KtCallExpression): Prepared? {
@@ -90,20 +102,21 @@ object MermaidExporter {
     }
 
     /** Compile and run the prepared snippet. Safe to call off the EDT. Never throws. */
-    fun run(prepared: Prepared): ExportResult = try {
+    fun run(prepared: Prepared): ExportOutcome = try {
         doRun(prepared)
     } catch (t: Throwable) {
         LOG.warn("run: unexpected failure for strategy '${prepared.name}'", t)
-        ExportResult.Failure("Diagram generation failed", t.toString())
+        ExportOutcome(prepared.name, null, listOf(Problem("Diagram generation failed", t.toString())), cacheable = false)
     }
 
-    private fun doRun(prepared: Prepared): ExportResult {
+    private fun doRun(prepared: Prepared): ExportOutcome {
         val compilerJars = kotlinCompilerJars()
         LOG.info("run: located ${compilerJars.size} Kotlin compiler jars")
         if (compilerJars.isEmpty()) {
-            return ExportResult.Failure(
-                "Kotlin compiler not found",
-                "Could not locate the Kotlin compiler bundled with the IDE's Kotlin plugin.",
+            return ExportOutcome(
+                prepared.name, null,
+                listOf(Problem("Kotlin compiler not found", "Could not locate the IDE's bundled Kotlin compiler.")),
+                cacheable = false,
             )
         }
 
@@ -117,31 +130,26 @@ object MermaidExporter {
 
         // The snippet links against the user module (Koog + their node factories);
         // stdlib comes from the bundled compiler jars (-no-stdlib uses what's on -classpath).
-        val compileCp = (prepared.moduleClasspath + compilerJars).joinToString(File.pathSeparator)
-        val compile = GeneralCommandLine(prepared.javaExe).apply {
-            addParameters("-cp", compilerJars.joinToString(File.pathSeparator))
-            addParameter(K2_COMPILER)
-            addParameters("-classpath", compileCp)
-            addParameters("-d", outDir.absolutePath)
-            addParameters("-jvm-target", JVM_TARGET)
-            addParameters("-no-stdlib", "-no-reflect")
-            addParameter(srcFile.absolutePath)
-            charset = StandardCharsets.UTF_8
-        }
-        // Full command is huge (classpath); dump it next to the sources for inspection.
-        File(workDir, "compile-cmd.txt").writeText(compile.commandLineString)
+        val compileClasspath = prepared.moduleClasspath + compilerJars
 
-        LOG.info("run: compiling (timeout ${COMPILE_TIMEOUT_MS}ms, compile classpath=${prepared.moduleClasspath.size + compilerJars.size} entries)…")
-        var compileOut: com.intellij.execution.process.ProcessOutput? = null
-        val compileMs = measureTimeMillis { compileOut = exec(compile, COMPILE_TIMEOUT_MS) }
-        val co = compileOut
-            ?: return ExportResult.Failure("Compilation timed out", "kotlinc took longer than ${COMPILE_TIMEOUT_MS}ms.")
+        // Prefer the warm daemon (run with the IDE's JRE; bytecode target is fixed by
+        // -jvm-target so it's independent of this JVM). Fall back to a cold one-shot.
+        val daemonJava = ideJavaExe()
+        var cr: CompilerDaemon.CompileResult? = null
+        val compileMs = measureTimeMillis {
+            cr = CompilerDaemon.compile(daemonJava, compilerJars, srcFile, outDir, compileClasspath, JVM_TARGET)
+            if (cr == null) {
+                LOG.info("run: daemon unavailable — cold compile")
+                cr = coldCompile(prepared.javaExe, compilerJars, srcFile, outDir, compileClasspath, workDir)
+            }
+        }
+        val compile = cr
+            ?: return ExportOutcome(prepared.name, null, listOf(Problem("Compilation timed out", "kotlinc exceeded ${COMPILE_TIMEOUT_MS}ms.")), cacheable = false)
                 .also { LOG.warn("run: compile timed out after ${compileMs}ms") }
-        LOG.info("run: compile finished in ${compileMs}ms, exit=${co.exitCode}, stdout=${co.stdout.length} chars, stderr=${co.stderr.length} chars")
-        if (co.exitCode != 0) {
-            val detail = co.stderr.ifBlank { co.stdout }.trim()
-            LOG.warn("run: compilation FAILED:\n$detail")
-            return ExportResult.Failure("Strategy snippet does not compile", detail)
+        LOG.info("run: compile finished in ${compileMs}ms, exit=${compile.exitCode}, diagnostics=${compile.diagnostics.length} chars")
+        if (compile.exitCode != 0) {
+            LOG.warn("run: compilation FAILED:\n${compile.diagnostics.trim()}")
+            return ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics))
         }
 
         val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars)
@@ -157,14 +165,19 @@ object MermaidExporter {
         var runOutput: com.intellij.execution.process.ProcessOutput? = null
         val runMs = measureTimeMillis { runOutput = exec(runCmd, RUN_TIMEOUT_MS) }
         val ro = runOutput
-            ?: return ExportResult.Failure("Strategy run timed out", "Execution took longer than ${RUN_TIMEOUT_MS}ms.")
+            ?: return ExportOutcome(prepared.name, null, listOf(Problem("Strategy run timed out", "Execution exceeded ${RUN_TIMEOUT_MS}ms.")), cacheable = false)
                 .also { LOG.warn("run: execution timed out after ${runMs}ms") }
         LOG.info("run: execution finished in ${runMs}ms, exit=${ro.exitCode}, stdout=${ro.stdout.length} chars, stderr=${ro.stderr.length} chars")
 
-        val mermaid = between(ro.stdout, StrategySnippet.BEGIN_MARKER, StrategySnippet.END_MARKER)
-        if (mermaid != null && mermaid.isNotBlank()) {
-            LOG.info("run: diagram extracted (${mermaid.trim().length} chars) for '${prepared.name}'")
-            return ExportResult.Success(prepared.name, mermaid.trim())
+        between(ro.stdout, StrategySnippet.BEGIN_MARKER, StrategySnippet.END_MARKER)?.takeIf { it.isNotBlank() }?.let {
+            LOG.info("run: diagram extracted (${it.trim().length} chars) for '${prepared.name}'")
+            return ExportOutcome(prepared.name, it.trim(), emptyList())
+        }
+        // generate() threw: a graph validation error. Keep the previous diagram; report it.
+        between(ro.stdout, StrategySnippet.ERROR_BEGIN_MARKER, StrategySnippet.ERROR_END_MARKER)?.takeIf { it.isNotBlank() }?.let {
+            val msg = it.trim()
+            LOG.info("run: graph error for '${prepared.name}': $msg")
+            return ExportOutcome(prepared.name, null, listOf(Problem(msg)))
         }
         val detail = buildString {
             appendLine("exit=${ro.exitCode}")
@@ -172,7 +185,48 @@ object MermaidExporter {
             if (ro.stdout.isNotBlank()) appendLine("stdout:\n${ro.stdout.trim()}")
         }.trim()
         LOG.warn("run: no diagram markers in output:\n$detail")
-        return ExportResult.Failure("Ran, but no diagram was produced", detail)
+        return ExportOutcome(prepared.name, null, listOf(Problem("Ran, but no diagram was produced", detail)))
+    }
+
+    /** One-shot fallback compile. Returns null on timeout / failure to start. */
+    private fun coldCompile(
+        javaExe: String,
+        compilerJars: List<String>,
+        srcFile: File,
+        outDir: File,
+        compileClasspath: List<String>,
+        workDir: File,
+    ): CompilerDaemon.CompileResult? {
+        val cmd = GeneralCommandLine(javaExe).apply {
+            addParameters("-cp", compilerJars.joinToString(File.pathSeparator))
+            addParameter(K2_COMPILER)
+            addParameters("-classpath", compileClasspath.joinToString(File.pathSeparator))
+            addParameters("-d", outDir.absolutePath)
+            addParameters("-jvm-target", JVM_TARGET)
+            addParameters("-no-stdlib", "-no-reflect")
+            addParameter(srcFile.absolutePath)
+            charset = StandardCharsets.UTF_8
+        }
+        File(workDir, "compile-cmd.txt").writeText(cmd.commandLineString)
+        val out = exec(cmd, COMPILE_TIMEOUT_MS) ?: return null
+        return CompilerDaemon.CompileResult(out.exitCode, out.stderr.ifBlank { out.stdout })
+    }
+
+    /** kotlinc diagnostics → one Problem per error/warning line. */
+    private fun parseCompileDiagnostics(diagnostics: String): List<Problem> {
+        val rows = diagnostics.lineSequence()
+            .map { it.trim() }
+            .filter { it.contains(": error:") || it.contains(": warning:") }
+            .map { Problem(it) }
+            .toList()
+        return rows.ifEmpty {
+            listOf(Problem("Strategy snippet does not compile", diagnostics.trim().ifBlank { null }))
+        }
+    }
+
+    private fun ideJavaExe(): String {
+        val home = System.getProperty("java.home")
+        return File(File(home, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
     }
 
     private fun exec(cmd: GeneralCommandLine, timeoutMs: Int): com.intellij.execution.process.ProcessOutput? =
