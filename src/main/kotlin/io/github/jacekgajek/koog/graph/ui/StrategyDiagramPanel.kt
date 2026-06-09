@@ -54,6 +54,11 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
         add(splitter, BorderLayout.CENTER)
     }
 
+    /** Called (on the EDT) with a node/subgraph id when the user clicks it. */
+    var onNodeClick: (String) -> Unit
+        get() = view.onNodeClick
+        set(value) { view.onNodeClick = value }
+
     fun showDiagram(mermaid: String) = view.showDiagram(mermaid)
 
     fun showMessage(title: String, detail: String) = view.showMessage(title, detail)

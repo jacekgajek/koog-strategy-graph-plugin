@@ -1,12 +1,15 @@
 package io.github.jacekgajek.koog.graph.ui
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.io.FileUtil
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
+import com.intellij.ui.jcef.JBCefBrowserBase
+import com.intellij.ui.jcef.JBCefJSQuery
 import java.awt.BorderLayout
 import java.awt.Color
 import java.io.File
@@ -22,6 +25,12 @@ import javax.swing.JTextArea
 class MermaidView : JPanel(BorderLayout()), Disposable {
 
     private val browser: JBCefBrowser? = if (JBCefApp.isSupported()) JBCefBrowser() else null
+
+    /** Invoked (on the EDT) with a node/subgraph id when the user clicks it in the diagram. */
+    var onNodeClick: (String) -> Unit = {}
+
+    private val jsQuery: JBCefJSQuery? = browser?.let { JBCefJSQuery.create(it as JBCefBrowserBase) }
+
     private val fallback = JTextArea().apply {
         isEditable = false
         lineWrap = false
@@ -43,6 +52,14 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
             Disposer.register(this, b)
             add(b.component, BorderLayout.CENTER)
             copyAsset()
+            jsQuery?.let { q ->
+                Disposer.register(this, q)
+                q.addHandler { raw ->
+                    val id = raw?.trim().orEmpty()
+                    if (id.isNotEmpty()) ApplicationManager.getApplication().invokeLater { onNodeClick(id) }
+                    null
+                }
+            }
         } else {
             LOG.warn("MermaidView: JCEF not supported — using plain-text fallback")
             add(JScrollPane(fallback), BorderLayout.CENTER)
@@ -88,6 +105,32 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
         val bg = hex(JBColor.background())
         val fg = hex(JBColor.foreground())
         val theme = if (JBColor.isBright()) "default" else "dark"
+        // Click → source navigation. Only wired when JCEF (and the query) is available.
+        val clickJs = jsQuery?.let { q ->
+            """
+                function __koogNodeClick(id) { ${q.inject("id")} }
+                function koogBindClicks() {
+                  document.querySelectorAll('g.node').forEach(function (n) {
+                    n.addEventListener('click', function () {
+                      var l = n.querySelector('.nodeLabel, text');
+                      var id = ((l ? l.textContent : n.textContent) || '').trim();
+                      if (id) __koogNodeClick(id);
+                    });
+                  });
+                  document.querySelectorAll('g.cluster').forEach(function (c) {
+                    var l = c.querySelector('.cluster-label, text');
+                    if (!l) return;
+                    l.style.cursor = 'pointer';
+                    l.addEventListener('click', function (ev) {
+                      var id = (l.textContent || '').trim();
+                      if (id) __koogNodeClick(id);
+                      ev.stopPropagation();
+                    });
+                  });
+                }
+            """.trimIndent()
+        } ?: "function koogBindClicks() {}"
+
         return """
             <!doctype html>
             <html>
@@ -98,6 +141,10 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                   font-family: -apple-system, Segoe UI, sans-serif; }
                 #root { padding: 12px; }
                 .mermaid { line-height: 1.2; }
+                /* Make graph nodes look clickable. */
+                g.node { cursor: pointer; }
+                g.node:hover * { filter: brightness(1.18); }
+                g.cluster > .cluster-label:hover, g.cluster text:hover { text-decoration: underline; }
                 .msg h3 { margin: 0 0 8px; font-weight: 600; }
                 .msg .detail { white-space: pre-wrap; color: #c0392b; font-family: monospace;
                   font-size: 12px; }
@@ -107,9 +154,10 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
               <div id="root">$body</div>
               <script src="mermaid.min.js"></script>
               <script>
+                $clickJs
                 try {
                   mermaid.initialize({ startOnLoad: false, theme: '$theme', securityLevel: 'loose' });
-                  mermaid.run().catch(function (e) {
+                  mermaid.run().then(koogBindClicks).catch(function (e) {
                     document.getElementById('root').innerHTML =
                       '<pre class="detail">' + String(e && e.message ? e.message : e) + '</pre>';
                   });

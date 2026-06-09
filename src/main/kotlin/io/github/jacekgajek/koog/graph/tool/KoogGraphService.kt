@@ -9,6 +9,7 @@ import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
@@ -17,6 +18,8 @@ import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.SmartPointerManager
 import com.intellij.psi.SmartPsiElementPointer
+import com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.kotlin.psi.KtProperty
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.content.Content
 import com.intellij.ui.content.ContentManager
@@ -96,6 +99,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         content.isCloseable = true
         content.isPinnable = true
         val tab = GraphTab(pointer, view, content)
+        view.onNodeClick = tab::navigateToNode
         tab.listenTo(file)
         tabs += tab
         return tab
@@ -245,6 +249,26 @@ class KoogGraphService(private val project: Project) : Disposable {
                 }
                 view.setProblems(outcome.problems)
             }
+        }
+
+        /**
+         * Navigate from a clicked diagram node to its `val <id> by …` declaration.
+         * The Mermaid node id equals the property name, so we find the matching
+         * KtProperty inside the strategy call and jump to it.
+         */
+        fun navigateToNode(id: String) {
+            val target = runReadAction {
+                val call = pointer.element ?: return@runReadAction null
+                val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
+                    .firstOrNull { it.name == id } ?: return@runReadAction null
+                val vf = prop.containingFile?.virtualFile ?: return@runReadAction null
+                vf to prop.textOffset
+            }
+            if (target == null) {
+                LOG.info("navigateToNode: no declaration named '$id' in the strategy")
+                return
+            }
+            OpenFileDescriptor(project, target.first, target.second).navigate(true)
         }
 
         fun listenTo(file: VirtualFile?) {
