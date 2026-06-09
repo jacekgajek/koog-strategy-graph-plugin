@@ -14,7 +14,7 @@ import java.io.PrintStream
  *
  * Line protocol over stdin/stdout:
  *   stdin:  absolute path to a request file, or the literal `EXIT`
- *   request file (UTF-8 lines): outDir / jvmTarget / diagFile / srcFile / N / <N classpath entries>
+ *   request file (UTF-8 lines): outDir / jvmTarget / friendPaths / diagFile / srcFile / N / <N classpath entries>
  *   stdout: `DONE <exitCode>` once a compile finishes (diagnostics go to diagFile)
  */
 object CompilerWorkerMain {
@@ -41,18 +41,20 @@ object CompilerWorkerMain {
         val lines = requestFile.readLines()
         val outDir = lines[0]
         val jvmTarget = lines[1]
-        val diagFile = lines[2]
-        val srcFile = lines[3]
-        val n = lines[4].toInt()
-        val classpath = lines.subList(5, 5 + n).joinToString(File.pathSeparator)
+        val friendPaths = lines[2]
+        val diagFile = lines[3]
+        val srcFile = lines[4]
+        val n = lines[5].toInt()
+        val classpath = lines.subList(6, 6 + n).joinToString(File.pathSeparator)
 
-        val args = arrayOf(
-            "-classpath", classpath,
-            "-d", outDir,
-            "-jvm-target", jvmTarget,
-            "-no-stdlib", "-no-reflect",
-            srcFile,
-        )
+        val args = buildList {
+            add("-classpath"); add(classpath)
+            add("-d"); add(outDir)
+            add("-jvm-target"); add(jvmTarget)
+            if (friendPaths.isNotBlank()) add("-Xfriend-paths=$friendPaths")
+            add("-no-stdlib"); add("-no-reflect")
+            add(srcFile)
+        }.toTypedArray()
         PrintStream(File(diagFile).outputStream(), true, "UTF-8").use { diag ->
             val cls = Class.forName("org.jetbrains.kotlin.cli.jvm.K2JVMCompiler")
             val compiler = cls.getDeclaredConstructor().newInstance()

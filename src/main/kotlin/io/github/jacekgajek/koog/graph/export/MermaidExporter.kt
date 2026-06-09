@@ -6,6 +6,7 @@ import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.module.ModuleUtilCore
+import com.intellij.openapi.roots.CompilerModuleExtension
 import com.intellij.openapi.roots.ModuleRootManager
 import com.intellij.openapi.roots.OrderEnumerator
 import com.intellij.openapi.util.io.FileUtil
@@ -48,6 +49,10 @@ object MermaidExporter {
         val source: String,
         val moduleClasspath: List<String>,
         val javaExe: String,
+        /** FQN of the generated runner's main class (depends on the file's package). */
+        val mainClass: String,
+        /** Module output dir(s) passed via -Xfriend-paths so `internal` symbols resolve. */
+        val friendPaths: List<String>,
     )
 
     /** A single row for the Problems-style table. */
@@ -90,15 +95,27 @@ object MermaidExporter {
         val javaHome = moduleSdkHome ?: System.getProperty("java.home")
         val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
 
+        // Treat the module's own output as a "friend" so the runner can read its
+        // internal declarations (the same mechanism test source sets use).
+        val ext = CompilerModuleExtension.getInstance(module)
+        val friendPaths = listOfNotNull(
+            ext?.compilerOutputPath?.path,
+            ext?.compilerOutputPathForTests?.path,
+        )
+
         LOG.info(
             "prepare: strategy='${snippet.name}', module='${module.name}', " +
                 "classpath=${classpath.size} entries, sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
-                "javaExe=$javaExe, snippet=${snippet.source.length} chars",
+                "javaExe=$javaExe, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
+                "snippet=${snippet.source.length} chars",
         )
         if (classpath.isEmpty()) {
             LOG.warn("prepare: module classpath is EMPTY — the module is probably not built yet")
         }
-        return Prepared(snippet.name, snippet.source, classpath, javaExe)
+        if (classpath.none { it.contains("mockk", ignoreCase = true) }) {
+            LOG.warn("prepare: no 'mockk' jar on the module classpath — strategies built by a function with parameters will fail to compile until mockk is a (test) dependency")
+        }
+        return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths)
     }
 
     /** Compile and run the prepared snippet. Safe to call off the EDT. Never throws. */
@@ -120,8 +137,7 @@ object MermaidExporter {
             )
         }
 
-        // Keep the work dir around (no delete-on-exit) so generated sources can be inspected.
-        val workDir = FileUtil.createTempDirectory("koog-mermaid", null, false)
+        val workDir = FileUtil.createTempDirectory("koog-mermaid", null, true)
         val srcFile = File(workDir, StrategySnippet.FILE_NAME).apply {
             writeText(prepared.source, StandardCharsets.UTF_8)
         }
@@ -137,10 +153,10 @@ object MermaidExporter {
         val daemonJava = ideJavaExe()
         var cr: CompilerDaemon.CompileResult? = null
         val compileMs = measureTimeMillis {
-            cr = CompilerDaemon.compile(daemonJava, compilerJars, srcFile, outDir, compileClasspath, JVM_TARGET)
+            cr = CompilerDaemon.compile(daemonJava, compilerJars, srcFile, outDir, compileClasspath, JVM_TARGET, prepared.friendPaths)
             if (cr == null) {
                 LOG.info("run: daemon unavailable — cold compile")
-                cr = coldCompile(prepared.javaExe, compilerJars, srcFile, outDir, compileClasspath, workDir)
+                cr = coldCompile(prepared.javaExe, compilerJars, srcFile, outDir, compileClasspath, prepared.friendPaths, workDir)
             }
         }
         val compile = cr
@@ -156,12 +172,12 @@ object MermaidExporter {
             .joinToString(File.pathSeparator)
         val runCmd = GeneralCommandLine(prepared.javaExe).apply {
             addParameters("-cp", runCp)
-            addParameter(StrategySnippet.MAIN_CLASS)
+            addParameter(prepared.mainClass)
             workDirectory = workDir
             charset = StandardCharsets.UTF_8
         }
 
-        LOG.info("run: executing ${StrategySnippet.MAIN_CLASS} (timeout ${RUN_TIMEOUT_MS}ms)…")
+        LOG.info("run: executing ${prepared.mainClass} (timeout ${RUN_TIMEOUT_MS}ms)…")
         var runOutput: com.intellij.execution.process.ProcessOutput? = null
         val runMs = measureTimeMillis { runOutput = exec(runCmd, RUN_TIMEOUT_MS) }
         val ro = runOutput
@@ -195,6 +211,7 @@ object MermaidExporter {
         srcFile: File,
         outDir: File,
         compileClasspath: List<String>,
+        friendPaths: List<String>,
         workDir: File,
     ): CompilerDaemon.CompileResult? {
         val cmd = GeneralCommandLine(javaExe).apply {
@@ -203,6 +220,7 @@ object MermaidExporter {
             addParameters("-classpath", compileClasspath.joinToString(File.pathSeparator))
             addParameters("-d", outDir.absolutePath)
             addParameters("-jvm-target", JVM_TARGET)
+            if (friendPaths.isNotEmpty()) addParameter("-Xfriend-paths=${friendPaths.joinToString(",")}")
             addParameters("-no-stdlib", "-no-reflect")
             addParameter(srcFile.absolutePath)
             charset = StandardCharsets.UTF_8

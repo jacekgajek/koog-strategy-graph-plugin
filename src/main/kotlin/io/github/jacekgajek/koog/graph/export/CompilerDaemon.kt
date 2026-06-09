@@ -41,6 +41,7 @@ object CompilerDaemon {
         outDir: File,
         classpath: List<String>,
         jvmTarget: String,
+        friendPaths: List<String>,
     ): CompileResult? = synchronized(lock) {
         try {
             ensureStarted(javaExe, compilerJars)
@@ -50,6 +51,7 @@ object CompilerDaemon {
                 buildString {
                     appendLine(outDir.absolutePath)
                     appendLine(jvmTarget)
+                    appendLine(friendPaths.joinToString(",")) // empty line if none
                     appendLine(diagFile.absolutePath)
                     appendLine(srcFile.absolutePath)
                     appendLine(classpath.size.toString())
