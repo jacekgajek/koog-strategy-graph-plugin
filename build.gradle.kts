@@ -18,16 +18,19 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        intellijIdeaCommunity(providers.gradleProperty("platformVersion"))
+        // IntelliJ IDEA Community is no longer published as a separate artifact
+        // since 2025.3 (253); the unified `intellijIdea(...)` accessor replaces
+        // `intellijIdeaCommunity(...)`.
+        intellijIdea(providers.gradleProperty("platformVersion"))
         bundledPlugin("org.jetbrains.kotlin")
         pluginVerifier()
         zipSigner()
         testFramework(TestFrameworkType.Platform)
     }
 
-    val elk = providers.gradleProperty("elkVersion").get()
-    implementation("org.eclipse.elk:org.eclipse.elk.core:$elk")
-    implementation("org.eclipse.elk:org.eclipse.elk.alg.layered:$elk")
+    // No extra compile/runtime deps: the generated runner is compiled by the Kotlin
+    // compiler already bundled with the IDE's Kotlin plugin (located by jar path, not
+    // loaded into our classloader) and linked against the user module's own Koog.
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.opentest4j:opentest4j:1.3.0")

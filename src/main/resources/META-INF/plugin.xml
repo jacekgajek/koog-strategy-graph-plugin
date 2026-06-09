@@ -7,11 +7,13 @@
         <p>Visualization for <a href="https://github.com/JetBrains/koog">Koog</a>
         agent <code>strategy { ... }</code> DSL blocks.</p>
         <p>A gutter icon next to every recognized <code>strategy(...)</code> call
-        loads a layered graph of all <code>val x by nodeXxx()</code> nodes and
-        <code>edge(a forwardTo b)</code> connections in that block into the
-        <em>Koog Strategy</em> tool window. Layout is computed by the Eclipse
-        Layout Kernel; rendering is pure Swing &mdash; no external tools are
-        required.</p>
+        renders the strategy as a Mermaid state diagram in the <em>Koog Strategy</em>
+        tool window. The diagram is produced by Koog's own
+        <code>MermaidDiagramGenerator</code>: the plugin lifts the
+        <code>strategy { }</code> snippet into a temporary program, compiles it
+        against your module, runs it, and displays the result &mdash; so the graph
+        always matches Koog's real interpretation of the strategy. This requires the
+        code to compile.</p>
     ]]></description>
 
     <change-notes><![CDATA[
