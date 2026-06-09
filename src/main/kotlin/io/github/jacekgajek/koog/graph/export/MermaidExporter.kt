@@ -10,6 +10,7 @@ import com.intellij.openapi.roots.CompilerModuleExtension
 import com.intellij.openapi.roots.ModuleRootManager
 import com.intellij.openapi.roots.OrderEnumerator
 import com.intellij.openapi.util.io.FileUtil
+import com.intellij.util.PathUtil
 import org.jetbrains.kotlin.psi.KtCallExpression
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -112,9 +113,6 @@ object MermaidExporter {
         if (classpath.isEmpty()) {
             LOG.warn("prepare: module classpath is EMPTY — the module is probably not built yet")
         }
-        if (classpath.none { it.contains("mockk", ignoreCase = true) }) {
-            LOG.warn("prepare: no 'mockk' jar on the module classpath — strategies built by a function with parameters will fail to compile until mockk is a (test) dependency")
-        }
         return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths)
     }
 
@@ -145,8 +143,11 @@ object MermaidExporter {
         LOG.info("run: workDir=${workDir.absolutePath}, wrote ${srcFile.name} (${prepared.source.length} chars)")
 
         // The snippet links against the user module (Koog + their node factories);
-        // stdlib comes from the bundled compiler jars (-no-stdlib uses what's on -classpath).
-        val compileClasspath = prepared.moduleClasspath + compilerJars
+        // stdlib comes from the bundled compiler jars (-no-stdlib uses what's on -classpath);
+        // mockk (bundled with the plugin) lets the runner stub function parameters.
+        val mockk = bundledMockkJars()
+        LOG.info("run: ${mockk.size} bundled mockk jars")
+        val compileClasspath = prepared.moduleClasspath + compilerJars + mockk
 
         // Prefer the warm daemon (run with the IDE's JRE; bytecode target is fixed by
         // -jvm-target so it's independent of this JVM). Fall back to a cold one-shot.
@@ -168,7 +169,7 @@ object MermaidExporter {
             return ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics))
         }
 
-        val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars)
+        val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars + mockk)
             .joinToString(File.pathSeparator)
         val runCmd = GeneralCommandLine(prepared.javaExe).apply {
             addParameters("-cp", runCp)
@@ -290,6 +291,27 @@ object MermaidExporter {
         }
         LOG.info("kotlinCompilerJars: found $compilerJar; using its directory")
         return jarsIn(compilerJar.parent)
+    }
+
+    /**
+     * mockk (+ byte-buddy/objenesis) ships as separate jars in the plugin's `lib/`
+     * dir. We locate them by name among the siblings of the plugin jar and add them
+     * to the runner's classpath. (They sit on our classloader but we never load them.)
+     */
+    private val mockkJarsCache: List<String> by lazy { locateMockkJars() }
+
+    private fun bundledMockkJars(): List<String> = mockkJarsCache
+
+    private fun locateMockkJars(): List<String> = try {
+        val libDir = File(PathUtil.getJarPathForClass(MermaidExporter::class.java)).parentFile
+        val names = listOf("mockk", "byte-buddy", "byte-buddy-agent", "objenesis")
+        libDir?.listFiles { f -> f.extension == "jar" && names.any { f.name.startsWith(it) } }
+            ?.map { it.absolutePath }
+            .orEmpty()
+            .also { if (it.isEmpty()) LOG.warn("locateMockkJars: no mockk jars found in $libDir") }
+    } catch (t: Throwable) {
+        LOG.warn("Failed to locate bundled mockk jars", t)
+        emptyList()
     }
 
     private fun jarsIn(dir: java.nio.file.Path): List<String> =

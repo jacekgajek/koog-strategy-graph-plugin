@@ -28,9 +28,24 @@ dependencies {
         testFramework(TestFrameworkType.Platform)
     }
 
-    // No extra compile/runtime deps: the generated runner is compiled by the Kotlin
-    // compiler already bundled with the IDE's Kotlin plugin (located by jar path, not
-    // loaded into our classloader) and linked against the user module's own Koog.
+    // The generated runner is compiled by the Kotlin compiler already bundled with
+    // the IDE's Kotlin plugin (located by jar path, not loaded into our classloader)
+    // and linked against the user module's own Koog.
+
+    // mockk (+ byte-buddy/objenesis) ships as separate jars in the plugin's lib/ so
+    // the generated runner can stub function parameters with mockk(relaxed = true).
+    // We never reference these classes from plugin code, so their presence on the
+    // classloader is inert; kotlin/kotlinx/junit/slf4j are excluded (provided by the
+    // compiler/module, or irrelevant).
+    implementation("io.mockk:mockk:${providers.gradleProperty("mockkVersion").get()}") {
+        exclude(group = "org.jetbrains.kotlin")
+        exclude(group = "org.jetbrains.kotlinx")
+        exclude(group = "junit")
+        exclude(group = "org.junit.jupiter")
+        exclude(group = "org.junit.platform")
+        exclude(group = "org.hamcrest")
+        exclude(group = "org.slf4j")
+    }
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.opentest4j:opentest4j:1.3.0")
