@@ -1,13 +1,17 @@
 package io.github.jacekgajek.koog.graph.tool
 
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.components.Service
+import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowManager
@@ -15,6 +19,10 @@ import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.SmartPointerManager
 import com.intellij.psi.SmartPsiElementPointer
 import com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.kotlin.psi.KtBinaryExpression
+import org.jetbrains.kotlin.psi.KtExpression
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
+import org.jetbrains.kotlin.psi.KtProperty
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.content.Content
 import com.intellij.ui.content.ContentManager
@@ -22,13 +30,9 @@ import com.intellij.ui.content.ContentManagerEvent
 import com.intellij.ui.content.ContentManagerListener
 import com.intellij.ui.content.ContentFactory
 import com.intellij.util.Alarm
-import io.github.jacekgajek.koog.graph.parser.StrategyParser
-import io.github.jacekgajek.koog.graph.render.ElkLayout
-import io.github.jacekgajek.koog.graph.render.GraphPanel
-import io.github.jacekgajek.koog.graph.render.LaidOutGraph
+import io.github.jacekgajek.koog.graph.export.MermaidExporter
+import io.github.jacekgajek.koog.graph.ui.StrategyDiagramPanel
 import org.jetbrains.kotlin.psi.KtCallExpression
-import java.awt.BorderLayout
-import javax.swing.JPanel
 import javax.swing.SwingConstants
 
 @Service(Service.Level.PROJECT)
@@ -41,15 +45,22 @@ class KoogGraphService(private val project: Project) : Disposable {
     private var placeholder: Content? = null
     private var contentListenerInstalled = false
 
+    /**
+     * Memoizes outcomes by generated-source text. The snippet fully determines the
+     * diagram, so an unchanged strategy re-renders instantly (no compile/run). LRU-
+     * bounded; accessed only on the EDT.
+     */
+    private val cache = object : LinkedHashMap<String, MermaidExporter.ExportOutcome>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<String, MermaidExporter.ExportOutcome>) = size > CACHE_SIZE
+    }
+
     fun showGraph(call: KtCallExpression) {
-        val resolved = runReadAction {
-            val graph = StrategyParser().parse(call) ?: return@runReadAction null
+        val ctx = runReadAction {
             val pointer = SmartPointerManager.getInstance(project).createSmartPsiElementPointer(call)
             val file = call.containingFile?.virtualFile
-            Triple(graph, pointer, file)
-        } ?: return
-        val (graph, pointer, file) = resolved
-        val laidOut = ElkLayout.layout(graph)
+            pointer to file
+        }
+        val (pointer, file) = ctx
 
         val tw = ToolWindowManager.getInstance(project).getToolWindow(TOOL_WINDOW_ID) ?: return
         val cm = tw.contentManager
@@ -60,12 +71,13 @@ class KoogGraphService(private val project: Project) : Disposable {
         // are the platform's standard tab affordances (canCloseContents in plugin.xml).
         val reuse = reusableTab(cm)
         val target = if (reuse != null) {
-            reuse.repoint(graph.name, laidOut, pointer, file)
+            reuse.retarget(pointer, file)
             reuse.content
         } else {
             removePlaceholder(cm)
-            val tab = createTab(graph.name, laidOut, pointer, file)
+            val tab = createTab(pointer, file)
             cm.addContent(tab.content)
+            tab.render()
             tab.content
         }
         cm.setSelectedContent(target)
@@ -82,26 +94,22 @@ class KoogGraphService(private val project: Project) : Disposable {
     }
 
     private fun createTab(
-        name: String,
-        laidOut: LaidOutGraph,
         pointer: SmartPsiElementPointer<KtCallExpression>,
         file: VirtualFile?,
     ): GraphTab {
-        val wrapper = JPanel(BorderLayout())
-        val panel = GraphPanel(laidOut, project)
-        wrapper.add(panel, BorderLayout.CENTER)
-
-        val content = ContentFactory.getInstance().createContent(wrapper, name, false)
+        val view = StrategyDiagramPanel()
+        val content = ContentFactory.getInstance().createContent(view, "Koog graph", false)
         content.isCloseable = true
         content.isPinnable = true
-
-        val tab = GraphTab(pointer, panel, wrapper, content)
+        val tab = GraphTab(pointer, view, content)
+        view.onNodeClick = tab::navigateToNode
+        view.onEdgeClick = tab::navigateToEdge
         tab.listenTo(file)
         tabs += tab
         return tab
     }
 
-    /** Coalesce bursts of edits into a single re-parse once typing pauses. */
+    /** Coalesce bursts of edits into a single recompile once typing pauses. */
     private fun scheduleRefresh() {
         refreshAlarm.cancelAllRequests()
         refreshAlarm.addRequest(::refreshAll, REFRESH_DELAY_MS)
@@ -109,7 +117,7 @@ class KoogGraphService(private val project: Project) : Disposable {
 
     private fun refreshAll() {
         if (project.isDisposed) return
-        tabs.toList().forEach { it.refresh() }
+        tabs.toList().forEach { it.render() }
     }
 
     private fun ensureContentListener(cm: ContentManager) {
@@ -154,11 +162,10 @@ class KoogGraphService(private val project: Project) : Disposable {
         tabs.clear()
     }
 
-    /** Per-tab state: the displayed strategy, its panel, and an edit listener. */
+    /** Per-tab state: the displayed strategy, its diagram view, and an edit listener. */
     private inner class GraphTab(
         private var pointer: SmartPsiElementPointer<KtCallExpression>,
-        private var panel: GraphPanel,
-        private val wrapper: JPanel,
+        private val view: StrategyDiagramPanel,
         val content: Content,
     ) {
         private var document: Document? = null
@@ -166,42 +173,136 @@ class KoogGraphService(private val project: Project) : Disposable {
             override fun documentChanged(event: DocumentEvent) = scheduleRefresh()
         }
 
+        /** Discards stale async results when a newer render starts. */
+        private var generation = 0
+        private var hasDiagram = false
+
         /** Re-target this tab at a different strategy (tab reuse). */
-        fun repoint(
-            name: String,
-            laidOut: LaidOutGraph,
-            newPointer: SmartPsiElementPointer<KtCallExpression>,
-            file: VirtualFile?,
-        ) {
+        fun retarget(newPointer: SmartPsiElementPointer<KtCallExpression>, file: VirtualFile?) {
             pointer = newPointer
-            panel = GraphPanel(laidOut, project)
-            wrapper.removeAll()
-            wrapper.add(panel, BorderLayout.CENTER)
-            wrapper.revalidate()
-            wrapper.repaint()
-            content.displayName = name
+            hasDiagram = false
             listenTo(file)
+            render()
         }
 
         /**
-         * Re-parse and swap in the new graph. While the source is mid-edit and
-         * doesn't parse (syntax errors in the call, the call was deleted, or the
-         * parser bails) we keep the previous graph so it doesn't flicker or blank
-         * out between valid states.
+         * Recompile + run the strategy and show its diagram. Unchanged strategies are
+         * served instantly from [cache]. The compile/run happens off the EDT. When the
+         * code doesn't compile or the graph is invalid we keep the last good diagram
+         * and surface the problems in the table — so the graph never blanks out
+         * between valid states.
          */
-        fun refresh() {
+        fun render() {
+            val gen = ++generation
+            LOG.info("render: starting generation #$gen (hasDiagram=$hasDiagram)")
+
+            // Make PSI reflect the latest keystrokes before we lift the snippet.
             document?.let { doc ->
                 val pdm = PsiDocumentManager.getInstance(project)
                 if (!pdm.isCommitted(doc)) pdm.commitDocument(doc)
             }
-            val graph = runReadAction {
+
+            val prepared = runReadAction {
                 val call = pointer.element ?: return@runReadAction null
                 if (!call.isValid) return@runReadAction null
-                if (PsiTreeUtil.hasErrorElements(call)) return@runReadAction null
-                StrategyParser().parse(call)
-            } ?: return
-            panel.updateGraph(ElkLayout.layout(graph))
-            if (content.displayName != graph.name) content.displayName = graph.name
+                MermaidExporter.prepare(call)
+            }
+            if (prepared == null) {
+                LOG.info("render #$gen: prepare returned null (strategy gone / not in a module) — keeping current view")
+                if (!hasDiagram) view.showMessage("Cannot generate diagram", "The strategy is not inside a resolvable module, or the module isn't built yet.")
+                return
+            }
+
+            cache[prepared.source]?.let { cached ->
+                LOG.info("render #$gen: cache hit for '${cached.name}'")
+                apply(cached)
+                return
+            }
+
+            if (!hasDiagram) view.showMessage("Generating diagram…", "")
+            ApplicationManager.getApplication().executeOnPooledThread {
+                // Guard everything: an exception here must never leave the view stuck on "Generating…".
+                val outcome = try {
+                    MermaidExporter.run(prepared)
+                } catch (t: Throwable) {
+                    LOG.warn("render #$gen: export threw", t)
+                    MermaidExporter.ExportOutcome(prepared.name, null, listOf(MermaidExporter.Problem("Diagram generation failed", t.toString())), cacheable = false)
+                }
+                ApplicationManager.getApplication().invokeLater {
+                    if (project.isDisposed || gen != generation) {
+                        LOG.info("render #$gen: result discarded (stale=${gen != generation}, disposed=${project.isDisposed})")
+                        return@invokeLater
+                    }
+                    if (outcome.cacheable) cache[prepared.source] = outcome
+                    apply(outcome)
+                }
+            }
+        }
+
+        /** Apply an outcome to the view: update the diagram if present, always set problems. */
+        private fun apply(outcome: MermaidExporter.ExportOutcome) {
+            if (outcome.mermaid != null) {
+                view.showDiagram(outcome.mermaid)
+                content.displayName = outcome.name
+                hasDiagram = true
+                view.setProblems(emptyList())
+            } else {
+                if (!hasDiagram) {
+                    val first = outcome.problems.firstOrNull()
+                    view.showMessage(first?.message ?: "No diagram", first?.detail ?: "")
+                }
+                view.setProblems(outcome.problems)
+            }
+        }
+
+        /**
+         * Navigate from a clicked diagram node to its `val <id> by …` declaration.
+         * The Mermaid node id equals the property name, so we find the matching
+         * KtProperty inside the strategy call and jump to it.
+         */
+        fun navigateToNode(id: String) {
+            val target = runReadAction {
+                val call = pointer.element ?: return@runReadAction null
+                val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
+                    .firstOrNull { it.name == id } ?: return@runReadAction null
+                val vf = prop.containingFile?.virtualFile ?: return@runReadAction null
+                vf to prop.textOffset
+            }
+            if (target == null) {
+                LOG.info("navigateToNode: no declaration named '$id' in the strategy")
+                return
+            }
+            OpenFileDescriptor(project, target.first, target.second).navigate(true)
+        }
+
+        /**
+         * Navigate from a clicked edge to its `edge(from forwardTo to …)` definition.
+         * Koog edges are written with the `forwardTo` infix, so we look for the
+         * `from forwardTo to` expression whose operands name the clicked endpoints.
+         */
+        fun navigateToEdge(from: String, to: String) {
+            val target = runReadAction {
+                val call = pointer.element ?: return@runReadAction null
+                val binary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
+                    .firstOrNull {
+                        it.operationReference.getReferencedName() == "forwardTo" &&
+                            leadingName(it.left) == from && leadingName(it.right) == to
+                    } ?: return@runReadAction null
+                val vf = binary.containingFile?.virtualFile ?: return@runReadAction null
+                vf to binary.textOffset
+            }
+            if (target == null) {
+                LOG.info("navigateToEdge: no 'edge($from forwardTo $to)' found in the strategy")
+                return
+            }
+            OpenFileDescriptor(project, target.first, target.second).navigate(true)
+        }
+
+        /** The first (receiver-most) referenced name within an expression, or null. */
+        private fun leadingName(expr: KtExpression?): String? = when (expr) {
+            null -> null
+            is KtNameReferenceExpression -> expr.getReferencedName()
+            else -> PsiTreeUtil.findChildOfType(expr, KtNameReferenceExpression::class.java)?.getReferencedName()
         }
 
         fun listenTo(file: VirtualFile?) {
@@ -215,11 +316,16 @@ class KoogGraphService(private val project: Project) : Disposable {
         fun dispose() {
             document?.removeDocumentListener(listener)
             document = null
+            Disposer.dispose(view)
         }
     }
 
     companion object {
+        private val LOG = logger<KoogGraphService>()
         const val TOOL_WINDOW_ID = "Koog Strategy"
-        private const val REFRESH_DELAY_MS = 300
+
+        // Each edit triggers a recompile; wait longer than a single keystroke burst.
+        private const val REFRESH_DELAY_MS = 1500
+        private const val CACHE_SIZE = 64
     }
 }
