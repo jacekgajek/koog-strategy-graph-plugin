@@ -2,9 +2,7 @@ package io.github.jacekgajek.koog.graph.export
 
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.execution.process.CapturingProcessHandler
-import com.intellij.ide.plugins.PluginManagerCore
 import com.intellij.openapi.diagnostic.logger
-import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.openapi.roots.CompilerModuleExtension
 import com.intellij.openapi.roots.ModuleRootManager
@@ -15,6 +13,7 @@ import org.jetbrains.kotlin.psi.KtCallExpression
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.io.path.extension
 import kotlin.io.path.name
 import kotlin.system.measureTimeMillis
@@ -35,7 +34,6 @@ object MermaidExporter {
 
     private val LOG = logger<MermaidExporter>()
 
-    private const val KOTLIN_PLUGIN_ID = "org.jetbrains.kotlin"
     private const val K2_COMPILER = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler"
     // Koog's inline DSL functions are compiled to JVM target 17; kotlinc defaults to
     // 1.8, which refuses to inline newer bytecode. 17 also runs on any JDK >= 17,
@@ -261,14 +259,31 @@ object MermaidExporter {
      * our own classloader. Prefers a `kotlinc/lib` dist dir; otherwise falls back
      * to the directory containing `kotlin-compiler*.jar` found anywhere under the
      * plugin.
+     *
+     * The plugin is located via a class it owns ([KtCallExpression]) rather than the
+     * `PluginManager` descriptor APIs, which are all `@ApiStatus.Internal`.
      */
     private fun kotlinCompilerJars(): List<String> {
-        val root = PluginManagerCore.getPlugin(PluginId.getId(KOTLIN_PLUGIN_ID))?.pluginPath
-        if (root == null) {
-            LOG.warn("kotlinCompilerJars: Kotlin plugin path not found")
+        val markerJar = runCatching { Path.of(PathUtil.getJarPathForClass(KtCallExpression::class.java)) }
+            .getOrNull()
+        if (markerJar == null) {
+            LOG.warn("kotlinCompilerJars: could not locate the Kotlin plugin jar via KtCallExpression")
             return emptyList()
         }
-        LOG.info("kotlinCompilerJars: Kotlin plugin at $root")
+        LOG.info("kotlinCompilerJars: Kotlin PSI jar at $markerJar")
+
+        // Ascend from the PSI jar (under <plugin>/lib) to the plugin root, which
+        // holds the bundled compiler dist under kotlinc/lib.
+        var root: Path? = markerJar.parent
+        var hops = 0
+        while (root != null && hops++ < 6 && !Files.isDirectory(root.resolve("kotlinc").resolve("lib"))) {
+            root = root.parent
+        }
+        if (root == null) {
+            LOG.warn("kotlinCompilerJars: no kotlinc/lib found in any parent of $markerJar")
+            return emptyList()
+        }
+        LOG.info("kotlinCompilerJars: Kotlin plugin root at $root")
 
         val kotlincLib = root.resolve("kotlinc").resolve("lib")
         if (Files.isDirectory(kotlincLib)) {
