@@ -2,6 +2,12 @@ package io.github.jacekgajek.koog.graph.ui
 
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.util.Disposer
 import com.intellij.ui.JBColor
 import com.intellij.ui.JBSplitter
@@ -12,6 +18,7 @@ import com.intellij.util.ui.JBUI
 import io.github.jacekgajek.koog.graph.export.MermaidExporter.Problem
 import java.awt.BorderLayout
 import java.awt.Component
+import java.awt.datatransfer.StringSelection
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JTable
@@ -30,6 +37,9 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
     private val table = JBTable(model)
     private val problemsComponent: JComponent
     private val splitter = JBSplitter(true, 0.7f).apply { splitterProportionKey = "koog.graph.diagram.splitter" }
+
+    /** The Mermaid source currently displayed; backs the copy-to-clipboard action. */
+    private var currentMermaid: String? = null
 
     init {
         table.setShowGrid(false)
@@ -52,6 +62,29 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
         splitter.firstComponent = view
         splitter.secondComponent = null // hidden until there are problems
         add(splitter, BorderLayout.CENTER)
+        add(buildToolbarStrip(), BorderLayout.NORTH)
+    }
+
+    /** A thin top strip carrying the right-aligned "copy Mermaid code" toolbar button. */
+    private fun buildToolbarStrip(): JComponent {
+        val group = DefaultActionGroup(CopyMermaidAction())
+        val toolbar = ActionManager.getInstance().createActionToolbar("KoogStrategyDiagram", group, true)
+        toolbar.targetComponent = this
+        return JPanel(BorderLayout()).apply { add(toolbar.component, BorderLayout.EAST) }
+    }
+
+    private inner class CopyMermaidAction : AnAction(
+        "Copy Mermaid Code", "Copy the Mermaid diagram source to the clipboard", AllIcons.Actions.Copy,
+    ) {
+        override fun actionPerformed(e: AnActionEvent) {
+            currentMermaid?.let { CopyPasteManager.getInstance().setContents(StringSelection(it)) }
+        }
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentMermaid != null
+        }
+
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
     /** Called (on the EDT) with a node/subgraph id when the user clicks it. */
@@ -64,7 +97,10 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
         get() = view.onEdgeClick
         set(value) { view.onEdgeClick = value }
 
-    fun showDiagram(mermaid: String) = view.showDiagram(mermaid)
+    fun showDiagram(mermaid: String) {
+        currentMermaid = mermaid
+        view.showDiagram(mermaid)
+    }
 
     fun showMessage(title: String, detail: String) = view.showMessage(title, detail)
 

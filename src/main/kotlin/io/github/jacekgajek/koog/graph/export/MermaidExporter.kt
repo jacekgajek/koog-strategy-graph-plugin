@@ -2,7 +2,7 @@ package io.github.jacekgajek.koog.graph.export
 
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.execution.process.CapturingProcessHandler
-import com.intellij.ide.plugins.PluginManagerCore
+import com.intellij.ide.plugins.PluginManager
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.extensions.PluginId
 import com.intellij.openapi.module.ModuleUtilCore
@@ -263,7 +263,7 @@ object MermaidExporter {
      * plugin.
      */
     private fun kotlinCompilerJars(): List<String> {
-        val root = PluginManagerCore.getPlugin(PluginId.getId(KOTLIN_PLUGIN_ID))?.pluginPath
+        val root = PluginManager.getInstance().findEnabledPlugin(PluginId.getId(KOTLIN_PLUGIN_ID))?.pluginPath
         if (root == null) {
             LOG.warn("kotlinCompilerJars: Kotlin plugin path not found")
             return emptyList()
