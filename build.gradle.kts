@@ -58,7 +58,7 @@ kotlin {
 intellijPlatform {
     pluginConfiguration {
         ideaVersion {
-            sinceBuild = "242"
+            sinceBuild = "261"
             untilBuild = provider { null }
         }
     }
