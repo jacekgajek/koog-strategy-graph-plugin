@@ -3,6 +3,7 @@ package io.github.jacekgajek.koog.graph.export
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.execution.process.CapturingProcessHandler
 import com.intellij.openapi.diagnostic.logger
+import com.intellij.openapi.module.Module
 import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.openapi.roots.CompilerModuleExtension
 import com.intellij.openapi.roots.ModuleRootManager
@@ -83,7 +84,7 @@ object MermaidExporter {
             LOG.warn("prepare: no module found for strategy '${snippet.name}'; cannot resolve classpath")
             return null
         }
-        val classpath = OrderEnumerator.orderEntries(module)
+        val orderClasspath = OrderEnumerator.orderEntries(module)
             .recursively()
             .withoutSdk()
             .classes()
@@ -94,24 +95,60 @@ object MermaidExporter {
         val javaHome = moduleSdkHome ?: System.getProperty("java.home")
         val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
 
-        // Treat the module's own output as a "friend" so the runner can read its
-        // internal declarations (the same mechanism test source sets use).
+        // The module's own compiled output must be on the classpath so same-package
+        // siblings (referenced without an import) resolve, and a "friend" so the
+        // runner can read its `internal` declarations. IntelliJ's CompilerModuleExtension
+        // gives us these for JPS builds — but for Gradle-delegated builds it's often
+        // empty (the editor resolves siblings from source, not output). So we also
+        // derive the on-disk Gradle/IDEA output dirs and use whatever actually exists.
         val ext = CompilerModuleExtension.getInstance(module)
-        val friendPaths = listOfNotNull(
-            ext?.compilerOutputPath?.path,
-            ext?.compilerOutputPathForTests?.path,
-        )
+        val outputs = (listOfNotNull(ext?.compilerOutputPath?.path, ext?.compilerOutputPathForTests?.path) +
+            deriveModuleOutputs(module)).distinct()
+
+        val classpath = (orderClasspath + outputs).distinct()
+        val friendPaths = outputs
 
         LOG.info(
             "prepare: strategy='${snippet.name}', module='${module.name}', " +
-                "classpath=${classpath.size} entries, sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
+                "classpath=${classpath.size} entries (orderEntries=${orderClasspath.size}, outputs=${outputs.size}), " +
+                "sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
                 "javaExe=$javaExe, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
                 "snippet=${snippet.source.length} chars",
         )
-        if (classpath.isEmpty()) {
-            LOG.warn("prepare: module classpath is EMPTY — the module is probably not built yet")
+        if (outputs.isEmpty()) {
+            LOG.warn("prepare: no module output dir found — same-package siblings may not resolve; build the module")
         }
         return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths)
+    }
+
+    /**
+     * Best-effort discovery of a module's on-disk compiled output directories for
+     * Gradle/IDEA layouts, used when IntelliJ's compiler-output model is empty
+     * (typical for Gradle-delegated builds). Returns only directories that exist.
+     */
+    private fun deriveModuleOutputs(module: Module): List<String> {
+        val rm = ModuleRootManager.getInstance(module)
+        val roots = (rm.sourceRoots.toList() + rm.contentRoots.toList()).map { File(it.path) }
+        val subPaths = listOf(
+            "build/classes/kotlin/main", "build/classes/java/main",
+            "build/classes/kotlin/test", "build/classes/java/test",
+            "build/resources/main",
+            "out/production/classes", "out/test/classes",
+        )
+        val out = LinkedHashSet<String>()
+        for (root in roots) {
+            // Ascend to the module base: the nearest ancestor holding a build/out tree.
+            var dir: File? = root
+            var hops = 0
+            while (dir != null && hops++ < 6) {
+                if (File(dir, "build/classes").isDirectory || File(dir, "out/production").isDirectory) {
+                    subPaths.map { File(dir, it) }.filter { it.isDirectory }.forEach { out += it.absolutePath }
+                    break
+                }
+                dir = dir.parentFile
+            }
+        }
+        return out.toList()
     }
 
     /** Compile and run the prepared snippet. Safe to call off the EDT. Never throws. */
@@ -164,7 +201,10 @@ object MermaidExporter {
         LOG.info("run: compile finished in ${compileMs}ms, exit=${compile.exitCode}, diagnostics=${compile.diagnostics.length} chars")
         if (compile.exitCode != 0) {
             LOG.warn("run: compilation FAILED:\n${compile.diagnostics.trim()}")
-            return ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics))
+            // Don't cache: compile errors can depend on external state (an unbuilt
+            // module, a stale classpath) that a rebuild fixes without the strategy
+            // text changing — caching would pin the stale error.
+            return ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false)
         }
 
         val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars + mockk)

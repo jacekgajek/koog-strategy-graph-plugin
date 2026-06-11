@@ -2,7 +2,7 @@ package io.github.jacekgajek.koog.graph.tool
 
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.application.runReadActionBlocking
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.editor.Document
@@ -46,18 +46,18 @@ class KoogGraphService(private val project: Project) : Disposable {
     private var contentListenerInstalled = false
 
     /**
-     * Memoizes outcomes by generated-source text. The snippet fully determines the
-     * diagram, so an unchanged strategy re-renders instantly (no compile/run). LRU-
-     * bounded; accessed only on the EDT.
+     * Memoizes outcomes by the strategy expression's own text. The strategy fully
+     * determines the diagram, so an unchanged strategy re-renders instantly (no
+     * compile/run) even after the per-tab key is evicted. LRU-bounded; EDT only.
      */
     private val cache = object : LinkedHashMap<String, MermaidExporter.ExportOutcome>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: Map.Entry<String, MermaidExporter.ExportOutcome>) = size > CACHE_SIZE
     }
 
     fun showGraph(call: KtCallExpression) {
-        val ctx = runReadAction {
+        val ctx = runReadActionBlocking {
             val pointer = SmartPointerManager.getInstance(project).createSmartPsiElementPointer(call)
-            val file = call.containingFile?.virtualFile
+            val file = call.containingFile.virtualFile
             pointer to file
         }
         val (pointer, file) = ctx
@@ -98,7 +98,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         file: VirtualFile?,
     ): GraphTab {
         val view = StrategyDiagramPanel()
-        val content = ContentFactory.getInstance().createContent(view, "Koog graph", false)
+        val content = ContentFactory.getInstance().createContent(view, "Koog Graph", false)
         content.isCloseable = true
         content.isPinnable = true
         val tab = GraphTab(pointer, view, content)
@@ -177,45 +177,68 @@ class KoogGraphService(private val project: Project) : Disposable {
         private var generation = 0
         private var hasDiagram = false
 
+        /** Text of the strategy expression behind the current diagram; null until one renders. */
+        private var lastKey: String? = null
+
         /** Re-target this tab at a different strategy (tab reuse). */
         fun retarget(newPointer: SmartPsiElementPointer<KtCallExpression>, file: VirtualFile?) {
             pointer = newPointer
             hasDiagram = false
+            lastKey = null
             listenTo(file)
             render()
         }
 
         /**
-         * Recompile + run the strategy and show its diagram. Unchanged strategies are
-         * served instantly from [cache]. The compile/run happens off the EDT. When the
-         * code doesn't compile or the graph is invalid we keep the last good diagram
-         * and surface the problems in the table — so the graph never blanks out
-         * between valid states.
+         * Recompile + run the strategy and show its diagram. The diagram is keyed on the
+         * strategy expression's own text, so edits elsewhere in the file are ignored: an
+         * unchanged strategy short-circuits before any compile. Unchanged-but-evicted
+         * strategies are served from [cache]. The compile/run happens off the EDT. When
+         * the code doesn't compile or the graph is invalid we keep the last good diagram
+         * and surface the problems in the table — so the graph never blanks out between
+         * valid states.
          */
         fun render() {
             val gen = ++generation
             LOG.info("render: starting generation #$gen (hasDiagram=$hasDiagram)")
 
-            // Make PSI reflect the latest keystrokes before we lift the snippet.
+            // Make PSI reflect the latest keystrokes before we read the strategy text.
             document?.let { doc ->
                 val pdm = PsiDocumentManager.getInstance(project)
                 if (!pdm.isCommitted(doc)) pdm.commitDocument(doc)
             }
 
-            val prepared = runReadAction {
-                val call = pointer.element ?: return@runReadAction null
-                if (!call.isValid) return@runReadAction null
+            val key = runReadActionBlocking {
+                val call = pointer.element ?: return@runReadActionBlocking null
+                if (!call.isValid) return@runReadActionBlocking null
+                call.text
+            }
+            if (key == null) {
+                LOG.info("render #$gen: strategy gone / invalid — keeping current view")
+                if (!hasDiagram) view.showMessage("Cannot generate diagram", "The strategy is not inside a resolvable module, or the module isn't built yet.")
+                return
+            }
+
+            // The strategy itself hasn't changed (only the rest of the file) — nothing to do.
+            if (key == lastKey && hasDiagram) {
+                LOG.info("render #$gen: strategy unchanged — skipping")
+                return
+            }
+
+            cache[key]?.let { cached ->
+                LOG.info("render #$gen: cache hit for '${cached.name}'")
+                apply(cached, key)
+                return
+            }
+
+            val prepared = runReadActionBlocking {
+                val call = pointer.element ?: return@runReadActionBlocking null
+                if (!call.isValid) return@runReadActionBlocking null
                 MermaidExporter.prepare(call)
             }
             if (prepared == null) {
                 LOG.info("render #$gen: prepare returned null (strategy gone / not in a module) — keeping current view")
                 if (!hasDiagram) view.showMessage("Cannot generate diagram", "The strategy is not inside a resolvable module, or the module isn't built yet.")
-                return
-            }
-
-            cache[prepared.source]?.let { cached ->
-                LOG.info("render #$gen: cache hit for '${cached.name}'")
-                apply(cached)
                 return
             }
 
@@ -233,18 +256,19 @@ class KoogGraphService(private val project: Project) : Disposable {
                         LOG.info("render #$gen: result discarded (stale=${gen != generation}, disposed=${project.isDisposed})")
                         return@invokeLater
                     }
-                    if (outcome.cacheable) cache[prepared.source] = outcome
-                    apply(outcome)
+                    if (outcome.cacheable) cache[key] = outcome
+                    apply(outcome, key)
                 }
             }
         }
 
         /** Apply an outcome to the view: update the diagram if present, always set problems. */
-        private fun apply(outcome: MermaidExporter.ExportOutcome) {
+        private fun apply(outcome: MermaidExporter.ExportOutcome, key: String) {
             if (outcome.mermaid != null) {
                 view.showDiagram(outcome.mermaid)
                 content.displayName = outcome.name
                 hasDiagram = true
+                lastKey = key
                 view.setProblems(emptyList())
             } else {
                 if (!hasDiagram) {
@@ -261,11 +285,11 @@ class KoogGraphService(private val project: Project) : Disposable {
          * KtProperty inside the strategy call and jump to it.
          */
         fun navigateToNode(id: String) {
-            val target = runReadAction {
-                val call = pointer.element ?: return@runReadAction null
+            val target = runReadActionBlocking {
+                val call = pointer.element ?: return@runReadActionBlocking null
                 val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
-                    .firstOrNull { it.name == id } ?: return@runReadAction null
-                val vf = prop.containingFile?.virtualFile ?: return@runReadAction null
+                    .firstOrNull { it.name == id } ?: return@runReadActionBlocking null
+                val vf = prop.containingFile.virtualFile ?: return@runReadActionBlocking null
                 vf to prop.textOffset
             }
             if (target == null) {
@@ -281,14 +305,14 @@ class KoogGraphService(private val project: Project) : Disposable {
          * `from forwardTo to` expression whose operands name the clicked endpoints.
          */
         fun navigateToEdge(from: String, to: String) {
-            val target = runReadAction {
-                val call = pointer.element ?: return@runReadAction null
+            val target = runReadActionBlocking {
+                val call = pointer.element ?: return@runReadActionBlocking null
                 val binary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
                     .firstOrNull {
                         it.operationReference.getReferencedName() == "forwardTo" &&
                             leadingName(it.left) == from && leadingName(it.right) == to
-                    } ?: return@runReadAction null
-                val vf = binary.containingFile?.virtualFile ?: return@runReadAction null
+                    } ?: return@runReadActionBlocking null
+                val vf = binary.containingFile?.virtualFile ?: return@runReadActionBlocking null
                 vf to binary.textOffset
             }
             if (target == null) {

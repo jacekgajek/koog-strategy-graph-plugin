@@ -10,9 +10,13 @@ import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
 import com.intellij.ui.jcef.JBCefJSQuery
+import org.cef.browser.CefBrowser
+import org.cef.browser.CefFrame
+import org.cef.handler.CefLoadHandlerAdapter
 import java.awt.BorderLayout
 import java.awt.Color
 import java.io.File
+import java.util.Base64
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
@@ -21,6 +25,11 @@ import javax.swing.JTextArea
  * Renders a Mermaid diagram in an embedded JCEF browser using the bundled
  * `mermaid.min.js`. Falls back to showing the raw diagram / message as text when
  * JCEF isn't available (e.g. a runtime without the bundled Chromium).
+ *
+ * The page is loaded exactly once; every subsequent diagram/message is pushed in
+ * via `executeJavaScript`. Diagrams are rendered off-DOM and swapped in a single
+ * step, so the previous diagram stays on screen until the new one is ready — no
+ * blank "reloading" flash between refreshes.
  */
 class MermaidView : JPanel(BorderLayout()), Disposable {
 
@@ -40,13 +49,13 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
         font = java.awt.Font(java.awt.Font.MONOSPACED, java.awt.Font.PLAIN, 13)
     }
 
-    /** Per-view temp dir holding mermaid.min.js + the rendered page files. */
+    /** Per-view temp dir holding mermaid.min.js + the single page file. */
     private val workDir = FileUtil.createTempDirectory("koog-mermaid-view", null, true)
 
-    // CEF caches by URL: reloading the same file path shows the stale page. So each
-    // render gets a fresh page-N.html URL; we delete the previous one to bound disk.
-    private var pageSeq = 0
-    private var lastPage: File? = null
+    // The page loads asynchronously; JS pushed before it's ready is coalesced into
+    // `pending` (latest state wins) and flushed on load end.
+    private var pageReady = false
+    private var pending: String? = null
 
     init {
         val b = browser
@@ -62,6 +71,16 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                     null
                 }
             }
+            b.jbCefClient.addLoadHandler(object : CefLoadHandlerAdapter() {
+                override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
+                    ApplicationManager.getApplication().invokeLater {
+                        pageReady = true
+                        pending?.let { js -> pending = null; exec(js) }
+                    }
+                }
+            }, b.cefBrowser)
+            val shell = File(workDir, "index.html").apply { writeText(shellHtml()) }
+            b.loadURL(shell.toURI().toString())
         } else {
             LOG.warn("MermaidView: JCEF not supported — using plain-text fallback")
             add(JScrollPane(fallback), BorderLayout.CENTER)
@@ -69,7 +88,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
         showMessage("Loading strategy graph…", "")
     }
 
-    /** Decode a `kindarg…` message from the page and fire the matching callback on the EDT. */
+    /** Decode a `kindarg…` message from the page and fire the matching callback on the EDT. */
     private fun dispatch(raw: String?) {
         val parts = raw.orEmpty().split('\u0001')
         when (parts.getOrNull(0)) {
@@ -87,7 +106,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
 
     fun showDiagram(mermaid: String) {
         val b = browser ?: run { fallback.text = mermaid; return }
-        load(b, "<pre class=\"mermaid\">${esc(mermaid)}</pre>")
+        runJs("koogRender('${b64(mermaid)}')")
     }
 
     fun showMessage(title: String, detail: String) {
@@ -95,21 +114,18 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
             fallback.text = if (detail.isBlank()) title else "$title\n\n$detail"
             return
         }
-        val body = buildString {
-            append("<div class=\"msg\"><h3>").append(esc(title)).append("</h3>")
-            if (detail.isNotBlank()) append("<pre class=\"detail\">").append(esc(detail)).append("</pre>")
-            append("</div>")
-        }
-        load(b, body)
+        runJs("koogMessage('${b64(title)}', '${b64(detail)}')")
     }
 
-    private fun load(b: JBCefBrowser, body: String) {
-        val file = File(workDir, "page-${++pageSeq}.html")
-        file.writeText(page(body))
-        LOG.info("MermaidView: loading ${file.toURI()} (body=${body.length} chars)")
-        b.loadURL(file.toURI().toString())
-        lastPage?.delete()
-        lastPage = file
+    /** Run JS in the page now, or queue it (latest wins) until the page has loaded. */
+    private fun runJs(js: String) {
+        if (browser == null) return
+        if (pageReady) exec(js) else pending = js
+    }
+
+    private fun exec(js: String) {
+        val b = browser ?: return
+        b.cefBrowser.executeJavaScript(js, b.cefBrowser.url ?: "", 0)
     }
 
     private fun copyAsset() {
@@ -119,7 +135,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
         } ?: LOG.warn("Bundled mermaid.min.js not found on classpath")
     }
 
-    private fun page(body: String): String {
+    private fun shellHtml(): String {
         val bg = hex(JBColor.background())
         val fg = hex(JBColor.foreground())
         val theme = if (JBColor.isBright()) "default" else "dark"
@@ -130,11 +146,10 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 function __koogNodeClick(id) { __koogSend('node\u0001' + id); }
                 function __koogEdgeClick(f, t) { __koogSend('edge\u0001' + f + '\u0001' + t); }
 
-                // The Mermaid source survives in window.__koogSrc (captured before run()
-                // replaces the <pre>). edges[N] is the Nth edge in declaration order;
-                // Mermaid tags each rendered path with that same N in its id ("…-edgeN"),
-                // so we map a path to its endpoints by that index — NOT by DOM order,
-                // which the layout engine reshuffles (especially with subgraphs).
+                // edges[N] is the Nth edge in declaration order; Mermaid tags each
+                // rendered path with that same N in its id ("…-edgeN"), so we map a
+                // path to its endpoints by that index — NOT by DOM order, which the
+                // layout engine reshuffles (especially with subgraphs).
                 function koogEdges() {
                   var out = [];
                   (window.__koogSrc || '').split('\n').forEach(function (line) {
@@ -222,7 +237,6 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 html, body { margin: 0; padding: 0; height: 100%; background: $bg; color: $fg;
                   font-family: -apple-system, Segoe UI, sans-serif; }
                 #root { padding: 12px; }
-                .mermaid { line-height: 1.2; }
                 /* Make graph nodes look clickable. */
                 g.node { cursor: pointer; }
                 g.node:hover * { filter: brightness(1.18); }
@@ -236,21 +250,46 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
               </style>
             </head>
             <body>
-              <div id="root">$body</div>
+              <div id="root"></div>
               <script src="mermaid.min.js"></script>
               <script>
                 $clickJs
-                // Stash the raw diagram text before mermaid.run() swaps in the SVG.
-                window.__koogSrc = (document.querySelector('.mermaid') || {}).textContent || '';
-                try {
-                  mermaid.initialize({ startOnLoad: false, theme: '$theme', securityLevel: 'loose' });
-                  mermaid.run().then(koogBindClicks).catch(function (e) {
+
+                // UTF-8-safe base64 decode: the IDE hands us diagram/message text as
+                // base64 to dodge JS string-escaping pitfalls.
+                function __b64(s) {
+                  return decodeURIComponent(Array.prototype.map.call(atob(s), function (c) {
+                    return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+                  }).join(''));
+                }
+                function __esc(s) {
+                  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                }
+
+                mermaid.initialize({ startOnLoad: false, theme: '$theme', securityLevel: 'loose' });
+
+                var __seq = 0;
+                // Render off-DOM, then swap the whole #root in one shot: the old diagram
+                // stays visible until the new SVG is ready (effective double-buffering).
+                function koogRender(b64) {
+                  var text = __b64(b64);
+                  window.__koogSrc = text;
+                  mermaid.render('koogsvg' + (++__seq), text).then(function (res) {
+                    var root = document.getElementById('root');
+                    root.innerHTML = res.svg;
+                    if (res.bindFunctions) res.bindFunctions(root);
+                    koogBindClicks();
+                  }).catch(function (e) {
                     document.getElementById('root').innerHTML =
-                      '<pre class="detail">' + String(e && e.message ? e.message : e) + '</pre>';
+                      '<pre class="detail">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
                   });
-                } catch (e) {
-                  document.getElementById('root').innerHTML =
-                    '<pre class="detail">' + String(e) + '</pre>';
+                }
+                function koogMessage(b64t, b64d) {
+                  var t = __b64(b64t), d = __b64(b64d);
+                  var h = '<div class="msg"><h3>' + __esc(t) + '</h3>';
+                  if (d) h += '<pre class="detail">' + __esc(d) + '</pre>';
+                  h += '</div>';
+                  document.getElementById('root').innerHTML = h;
                 }
               </script>
             </body>
@@ -265,8 +304,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
     companion object {
         private val LOG = logger<MermaidView>()
 
-        private fun esc(s: String): String =
-            s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        private fun b64(s: String): String = Base64.getEncoder().encodeToString(s.toByteArray(Charsets.UTF_8))
 
         private fun hex(c: Color): String = String.format("#%02x%02x%02x", c.red, c.green, c.blue)
     }
