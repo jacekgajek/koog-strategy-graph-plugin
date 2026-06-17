@@ -1,10 +1,16 @@
 package io.github.jacekgajek.koog.graph.export
 
 import com.intellij.openapi.diagnostic.logger
+import com.intellij.psi.PsiElement
+import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.KtCallExpression
+import org.jetbrains.kotlin.psi.KtClass
+import org.jetbrains.kotlin.psi.KtClassBody
+import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtNamedFunction
+import org.jetbrains.kotlin.psi.KtObjectDeclaration
 import org.jetbrains.kotlin.psi.KtProperty
 
 /**
@@ -18,6 +24,10 @@ import org.jetbrains.kotlin.psi.KtProperty
  * obtains the strategy:
  *  - enclosing top-level `fun` → call it, passing `mockk(relaxed = true)` per parameter;
  *  - enclosing top-level `val` → reference it;
+ *  - enclosing **class member** `fun`/`val` → construct the class with a
+ *    `mockk(relaxed = true)` per constructor parameter, then call/reference the member;
+ *  - enclosing **object / companion** member → reference it via the object (or
+ *    enclosing class) name;
  *  - otherwise (inline) → evaluate the expression text in place (best effort).
  *
  * The compile is given `-Xfriend-paths=<module output>` so `internal` declarations of
@@ -79,36 +89,97 @@ data class StrategySnippet(
 
         /**
          * How `main()` should obtain the strategy. Prefers calling the enclosing
-         * top-level function/property (so captured params/helpers come for free);
+         * function/property declaration (so captured params/helpers come for free);
          * falls back to the expression text for inline strategies.
+         *
+         * The declaration may be top-level or a member of a class/object; for a
+         * plain class member we synthesize the receiver by constructing the class
+         * with `mockk(relaxed = true)` per constructor parameter.
          */
         private fun callerFor(call: KtCallExpression): String {
-            val decl = enclosingTopLevelDeclaration(call)
-            return when (decl) {
+            val member = enclosingMemberDeclaration(call) ?: return call.text
+            val container = member.parent
+
+            // The receiver expression the member is accessed through. "" means
+            // top-level (no receiver); null means we can't synthesize one.
+            val receiver: String? = when {
+                container is KtFile -> ""
+                container is KtClassBody -> {
+                    val owner = container.parent as? KtClassOrObject ?: return call.text
+                    receiverForClassOrObject(owner) ?: return call.text
+                }
+                else -> return call.text // local declaration, etc. — not callable from main()
+            }
+
+            val prefix = if (receiver.isNullOrEmpty()) "" else "$receiver."
+            return when (member) {
                 is KtNamedFunction -> {
-                    val fnName = decl.name
-                    if (fnName == null || decl.receiverTypeReference != null) {
+                    val fnName = member.name
+                    if (fnName == null || member.receiverTypeReference != null) {
                         call.text // extension/anonymous — can't call simply
                     } else {
-                        val args = decl.valueParameters.joinToString(", ") { "io.mockk.mockk(relaxed = true)" }
-                        "$fnName($args)"
+                        val args = member.valueParameters.joinToString(", ") { "io.mockk.mockk(relaxed = true)" }
+                        "$prefix$fnName($args)"
                     }
                 }
-                is KtProperty -> decl.name ?: call.text
+                is KtProperty -> member.name?.let { "$prefix$it" } ?: call.text
                 else -> call.text
             }
         }
 
-        /** The top-level (direct child of the file) fun/property that contains [call], if any. */
-        private fun enclosingTopLevelDeclaration(call: KtCallExpression): KtDeclaration? {
-            var el = call.parent
+        /**
+         * An expression that yields an instance the [owner]'s members can be accessed on.
+         *  - `object` / `companion object` → the object (or enclosing class) name;
+         *  - top-level constructable `class` → `Name(mockk(), …)` over its primary ctor;
+         *  - anything we can't safely instantiate (interface, abstract, sealed, enum,
+         *    annotation, generic, nested, private ctor) → null.
+         *
+         * The whole source file is copied verbatim into the snippet, so simple names
+         * resolve without qualification.
+         */
+        private fun receiverForClassOrObject(owner: KtClassOrObject): String? {
+            val name = owner.name ?: return null
+            return when (owner) {
+                is KtObjectDeclaration -> {
+                    if (owner.isCompanion()) {
+                        // companion members are reachable via the enclosing class name
+                        val outer = (owner.parent as? KtClassBody)?.parent as? KtClass ?: return null
+                        if (outer.parent !is KtFile) return null
+                        outer.name
+                    } else {
+                        if (owner.parent !is KtFile) return null
+                        name
+                    }
+                }
+                is KtClass -> {
+                    if (owner.parent !is KtFile) return null // only top-level classes
+                    if (owner.isInterface() || owner.isEnum() || owner.isAnnotation() || owner.isSealed()) return null
+                    if (owner.hasModifier(KtTokens.ABSTRACT_KEYWORD) || owner.hasModifier(KtTokens.INNER_KEYWORD)) return null
+                    if (owner.typeParameters.isNotEmpty()) return null
+                    val ctor = owner.primaryConstructor
+                    if (ctor != null && ctor.hasModifier(KtTokens.PRIVATE_KEYWORD)) return null
+                    val args = (ctor?.valueParameters ?: emptyList()).joinToString(", ") { "io.mockk.mockk(relaxed = true)" }
+                    "$name($args)"
+                }
+                else -> null
+            }
+        }
+
+        /**
+         * The outermost fun/property that directly contains [call] and is itself a
+         * direct member of a file or a class/object body (i.e. not a local declaration).
+         */
+        private fun enclosingMemberDeclaration(call: KtCallExpression): KtDeclaration? {
+            var el: PsiElement? = call.parent
             var candidate: KtDeclaration? = null
             while (el != null && el !is KtFile) {
-                if (el is KtNamedFunction || el is KtProperty) candidate = el as KtDeclaration
+                if (el is KtNamedFunction || el is KtProperty) {
+                    val p = el.parent
+                    if (p is KtFile || p is KtClassBody) candidate = el as KtDeclaration
+                }
                 el = el.parent
             }
-            // candidate is the outermost fun/property on the path to the file root.
-            return candidate?.takeIf { it.parent is KtFile }
+            return candidate
         }
 
         private fun strategyName(call: KtCallExpression): String? {
