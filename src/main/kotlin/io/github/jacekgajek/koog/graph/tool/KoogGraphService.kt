@@ -11,6 +11,9 @@ import com.intellij.openapi.compiler.CompilerTopics
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.editor.Document
+import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.editor.event.CaretEvent
+import com.intellij.openapi.editor.event.CaretListener
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
@@ -23,13 +26,16 @@ import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
+import com.intellij.psi.PsiFile
 import com.intellij.psi.SmartPointerManager
 import com.intellij.psi.SmartPsiElementPointer
 import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
+import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtProperty
+import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import com.intellij.ui.JBSplitter
 import com.intellij.ui.content.Content
 import com.intellij.ui.content.ContentManager
@@ -43,6 +49,17 @@ import io.github.jacekgajek.koog.graph.index.StrategyIndex
 import io.github.jacekgajek.koog.graph.ui.StrategyDiagramPanel
 import io.github.jacekgajek.koog.graph.ui.StrategyListPanel
 import org.jetbrains.kotlin.psi.KtCallExpression
+
+/**
+ * Mirrors Koog's `MermaidDiagramGenerator`: a node's diagram id is its display name with
+ * every non-`[a-zA-Z0-9_]` character replaced by `_`. We sanitize the same way to match a
+ * clicked edge endpoint back to its source declaration.
+ */
+private val MERMAID_ID_REGEX = Regex("[^a-zA-Z0-9_]")
+private fun String.toMermaidId(): String = replace(MERMAID_ID_REGEX, "_")
+
+/** A caret-driven highlight request: a node (by display name) or an edge (by from/to ids). */
+private data class Highlight(val node: String?, val from: String?, val to: String?)
 
 @Service(Service.Level.PROJECT)
 class KoogGraphService(private val project: Project) : Disposable {
@@ -90,6 +107,23 @@ class KoogGraphService(private val project: Project) : Disposable {
                 }
             },
         )
+
+        // Reverse navigation: as the caret moves over a node/edge declaration, highlight
+        // the matching part in every open graph showing that strategy.
+        EditorFactory.getInstance().eventMulticaster.addCaretListener(object : CaretListener {
+            override fun caretPositionChanged(event: CaretEvent) = onCaretMoved(event)
+        }, this)
+    }
+
+    private fun onCaretMoved(event: CaretEvent) {
+        if (project.isDisposed) return
+        val editor = event.editor
+        if (editor.project != null && editor.project !== project) return
+        val openTabs = listOfNotNull(previewTab) + tabs + detached
+        if (openTabs.isEmpty()) return
+        val vf = FileDocumentManager.getInstance().getFile(editor.document)
+        val offset = editor.caretModel.offset
+        openTabs.forEach { it.highlightAtCaret(vf, offset) }
     }
 
     /**
@@ -349,6 +383,12 @@ class KoogGraphService(private val project: Project) : Disposable {
             override fun documentChanged(event: DocumentEvent) = scheduleRefresh()
         }
 
+        /** The file this tab's strategy lives in; lets caret events skip unrelated files cheaply. */
+        private var currentFile: VirtualFile? = null
+
+        /** Last highlight pushed to the view; avoids re-sending JS on every caret tick. */
+        private var lastHighlight: Highlight? = null
+
         /** Called with the strategy name once it renders; used to title a detached window. */
         var onName: ((String) -> Unit)? = null
 
@@ -364,6 +404,9 @@ class KoogGraphService(private val project: Project) : Disposable {
             pointer = newPointer
             hasDiagram = false
             lastKey = null
+            // New strategy: drop any highlight from the previous one.
+            lastHighlight = null
+            view.highlight(null, null, null)
             listenTo(file)
             render()
         }
@@ -474,20 +517,20 @@ class KoogGraphService(private val project: Project) : Disposable {
         }
 
         /**
-         * Navigate from a clicked diagram node to its `val <id> by …` declaration.
-         * The Mermaid node id equals the property name, so we find the matching
-         * KtProperty inside the strategy call and jump to it.
+         * Navigate from a clicked diagram node to its `val <name> by …` declaration.
+         * The clicked id is the node's *display name* (Koog labels nodes with the
+         * `name = …` argument, falling back to the property name), which usually differs
+         * from the Kotlin variable — so we map it back to the declaring property.
          */
         fun navigateToNode(id: String) {
             val target = runReadActionBlocking {
                 val call = pointer?.element ?: return@runReadActionBlocking null
-                val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
-                    .firstOrNull { it.name == id } ?: return@runReadActionBlocking null
+                val prop = resolveNodeProperty(call, id) ?: return@runReadActionBlocking null
                 val vf = prop.containingFile.virtualFile ?: return@runReadActionBlocking null
                 vf to prop.textOffset
             }
             if (target == null) {
-                LOG.info("navigateToNode: no declaration named '$id' in the strategy")
+                LOG.info("navigateToNode: no declaration for node '$id' in the strategy")
                 return
             }
             OpenFileDescriptor(project, target.first, target.second).navigate(true)
@@ -495,16 +538,18 @@ class KoogGraphService(private val project: Project) : Disposable {
 
         /**
          * Navigate from a clicked edge to its `edge(from forwardTo to …)` definition.
-         * Koog edges are written with the `forwardTo` infix, so we look for the
-         * `from forwardTo to` expression whose operands name the clicked endpoints.
+         * The clicked endpoints are diagram ids (the sanitized node display names), so we
+         * map each back to the Kotlin variable used in the `forwardTo` infix.
          */
         fun navigateToEdge(from: String, to: String) {
             val target = runReadActionBlocking {
                 val call = pointer?.element ?: return@runReadActionBlocking null
+                val fromVar = resolveVarName(call, from)
+                val toVar = resolveVarName(call, to)
                 val binary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
                     .firstOrNull {
                         it.operationReference.getReferencedName() == "forwardTo" &&
-                            leadingName(it.left) == from && leadingName(it.right) == to
+                            leadingName(it.left) == fromVar && leadingName(it.right) == toVar
                     } ?: return@runReadActionBlocking null
                 val vf = binary.containingFile?.virtualFile ?: return@runReadActionBlocking null
                 vf to binary.textOffset
@@ -516,6 +561,64 @@ class KoogGraphService(private val project: Project) : Disposable {
             OpenFileDescriptor(project, target.first, target.second).navigate(true)
         }
 
+        /** The Kotlin variable behind a clicked edge endpoint id (or the id itself). */
+        private fun resolveVarName(call: KtCallExpression, token: String): String {
+            if (token == "nodeStart" || token == "nodeFinish") return token
+            return resolveNodeProperty(call, token)?.name ?: token
+        }
+
+        /**
+         * Find the delegated `val … by node…(…)` property whose node matches [token],
+         * which may be the raw display name (node click) or its sanitized Mermaid id
+         * (edge click), and falls back to the variable name.
+         */
+        private fun resolveNodeProperty(call: KtCallExpression, token: String): KtProperty? {
+            val file = call.containingFile
+            return PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java).firstOrNull { prop ->
+                if (!prop.hasDelegateExpression()) return@firstOrNull false
+                val display = nodeDisplayName(prop, file)
+                val name = prop.name
+                display == token || display.toMermaidId() == token ||
+                    name == token || (name != null && name.toMermaidId() == token)
+            }
+        }
+
+        /**
+         * The display name Koog gives a node: the explicit `name`/string argument of its
+         * delegate, or — when the delegate is a same-file helper function — the name of
+         * the `node(…)` built inside that helper; otherwise the property name.
+         */
+        private fun nodeDisplayName(prop: KtProperty, file: PsiFile): String {
+            val name = prop.name ?: ""
+            val delegate = prop.delegateExpression as? KtCallExpression ?: return name
+            explicitNodeName(delegate)?.let { return it }
+
+            val fnName = (delegate.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
+                ?: return name
+            val fn = PsiTreeUtil.findChildrenOfType(file, KtNamedFunction::class.java)
+                .firstOrNull { it.name == fnName } ?: return name
+            return PsiTreeUtil.findChildrenOfType(fn, KtCallExpression::class.java)
+                .firstNotNullOfOrNull { c ->
+                    val callee = (c.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
+                    if (callee?.startsWith("node") == true) explicitNodeName(c) else null
+                } ?: name
+        }
+
+        /** The string passed as `name = "…"` or the first positional string literal, if any. */
+        private fun explicitNodeName(call: KtCallExpression): String? {
+            call.valueArguments.forEach { arg ->
+                val literal = arg.getArgumentExpression() as? KtStringTemplateExpression ?: return@forEach
+                if (arg.getArgumentName()?.asName?.asString() == "name") return literalText(literal)
+            }
+            return call.valueArguments
+                .firstOrNull { it.getArgumentName() == null }
+                ?.let { it.getArgumentExpression() as? KtStringTemplateExpression }
+                ?.let { literalText(it) }
+        }
+
+        private fun literalText(template: KtStringTemplateExpression): String =
+            template.entries.joinToString("") { it.text }
+
         /** The first (receiver-most) referenced name within an expression, or null. */
         private fun leadingName(expr: KtExpression?): String? = when (expr) {
             null -> null
@@ -524,12 +627,73 @@ class KoogGraphService(private val project: Project) : Disposable {
         }
 
         fun listenTo(file: VirtualFile?) {
+            currentFile = file
             // getDocument walks the file model and needs a read action; we're on the EDT.
             val newDoc = file?.let { f -> runReadActionBlocking { FileDocumentManager.getInstance().getDocument(f) } }
             if (newDoc === document) return
             document?.removeDocumentListener(listener)
             document = newDoc
             newDoc?.addDocumentListener(listener)
+        }
+
+        /**
+         * Reverse navigation: given the editor caret at [offset] in [vf], highlight the
+         * node/edge under it in this tab's graph (or clear when the caret isn't on one).
+         * Cheap when the caret is in an unrelated file — no read action is taken.
+         */
+        fun highlightAtCaret(vf: VirtualFile?, offset: Int) {
+            val spec = if (currentFile != vf) Highlight(null, null, null)
+            else runReadActionBlocking {
+                val call = pointer?.element ?: return@runReadActionBlocking null
+                if (!call.isValid || !call.textRange.contains(offset)) Highlight(null, null, null)
+                else highlightFor(call, offset)
+            } ?: return // strategy gone — leave the current highlight be
+            if (spec == lastHighlight) return
+            lastHighlight = spec
+            view.highlight(spec.node, spec.from, spec.to)
+        }
+
+        /**
+         * The node/edge at [offset] within the strategy [call], as a highlight target.
+         * We pick the *innermost* match: an `edge(…)` inside a subgraph is smaller than the
+         * subgraph property that encloses it, so the edge wins — without this, a caret on an
+         * inner edge would resolve to (and highlight) the surrounding subgraph node.
+         */
+        private fun highlightFor(call: KtCallExpression, offset: Int): Highlight {
+            val file = call.containingFile
+            val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
+                .filter { it.hasDelegateExpression() && it.textRange.contains(offset) }
+                .minByOrNull { it.textRange.length }
+            val edgeCall = PsiTreeUtil.findChildrenOfType(call, KtCallExpression::class.java)
+                .filter {
+                    (it.calleeExpression as? KtNameReferenceExpression)?.getReferencedName() == "edge" &&
+                        it.textRange.contains(offset)
+                }
+                .minByOrNull { it.textRange.length }
+
+            val edgeIsMoreSpecific = edgeCall != null &&
+                (prop == null || edgeCall.textRange.length < prop.textRange.length)
+            if (edgeIsMoreSpecific) {
+                val binary = PsiTreeUtil.findChildrenOfType(edgeCall, KtBinaryExpression::class.java)
+                    .firstOrNull { it.operationReference.getReferencedName() == "forwardTo" }
+                val from = leadingName(binary?.left)
+                val to = leadingName(binary?.right)
+                if (from != null && to != null) {
+                    return Highlight(node = null, from = mermaidIdForVar(call, from), to = mermaidIdForVar(call, to))
+                }
+            }
+            if (prop != null) return Highlight(node = nodeDisplayName(prop, file), from = null, to = null)
+            return Highlight(null, null, null)
+        }
+
+        /** The Mermaid edge-endpoint id for a Kotlin variable used in a `forwardTo`. */
+        private fun mermaidIdForVar(call: KtCallExpression, varName: String): String {
+            if (varName == "nodeStart" || varName == "nodeFinish") return varName
+            val file = call.containingFile
+            val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
+                .firstOrNull { it.name == varName }
+            val display = prop?.let { nodeDisplayName(it, file) } ?: varName
+            return display.toMermaidId()
         }
 
         fun dispose() {

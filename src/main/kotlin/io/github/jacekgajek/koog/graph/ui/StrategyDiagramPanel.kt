@@ -124,6 +124,9 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
 
     fun showMessage(title: String, detail: String) = view.showMessage(title, detail)
 
+    /** Highlight (or clear, when all-null) the node/edge matching the editor caret. */
+    fun highlight(node: String?, from: String?, to: String?) = view.highlight(node, from, to)
+
     fun setProblems(problems: List<Problem>) {
         model.set(problems)
         val shouldShow = problems.isNotEmpty()

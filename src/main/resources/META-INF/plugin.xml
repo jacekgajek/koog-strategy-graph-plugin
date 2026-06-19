@@ -31,6 +31,12 @@
                 (and detached windows).</li>
             <li>Graphs (and the list) refresh automatically after a project build finishes,
                 so they reflect freshly compiled module output.</li>
+            <li>Reverse navigation: moving the editor caret onto a node declaration or an
+                <code>edge(…)</code> highlights the matching node/edge in the graph — including
+                subgraphs and edges inside them.</li>
+            <li>Strategies that are members of a class with non-mockable constructor
+                parameters (<code>String</code>, primitives) now render: those arguments get a
+                literal default instead of a mock.</li>
         </ul>
         <h3>0.1.4</h3>
         <ul>
