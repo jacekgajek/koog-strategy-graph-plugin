@@ -17,6 +17,21 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.5</h3>
+        <ul>
+            <li>The tool window now has an always-visible list of every <code>strategy { }</code>
+                in the project (found via the IDE's index, so it's instant). Click a strategy to
+                preview its graph beneath the list; double-click or press Enter to jump to its
+                source, or use the right-click <em>Open in New Tab</em> to open it in its own
+                pinned tab.</li>
+            <li>Graph tabs can be detached into their own floating window (the <em>Detach to
+                Window</em> toolbar button, or the list's right-click <em>Open in New Window</em>),
+                so several strategies can be compared side by side.</li>
+            <li>Added a refresh button to the tool window that re-generates the open graphs
+                (and detached windows).</li>
+            <li>Graphs (and the list) refresh automatically after a project build finishes,
+                so they reflect freshly compiled module output.</li>
+        </ul>
         <h3>0.1.4</h3>
         <ul>
             <li>Strategies defined as members of a class, <code>object</code> or companion

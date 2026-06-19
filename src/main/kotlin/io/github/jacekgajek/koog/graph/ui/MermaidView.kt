@@ -245,7 +245,9 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 /* Let clicks on a condition label fall through to the edge beneath it. */
                 g.edgeLabels { pointer-events: none; }
                 .msg h3 { margin: 0 0 8px; font-weight: 600; }
-                .msg .detail { white-space: pre-wrap; color: #c0392b; font-family: monospace;
+                .msg .detail { white-space: pre-wrap; color: $fg; opacity: 0.8;
+                  font-family: monospace; font-size: 12px; }
+                .error { white-space: pre-wrap; color: #c0392b; font-family: monospace;
                   font-size: 12px; }
               </style>
             </head>
@@ -281,7 +283,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                     koogBindClicks();
                   }).catch(function (e) {
                     document.getElementById('root').innerHTML =
-                      '<pre class="detail">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
+                      '<pre class="error">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
                   });
                 }
                 function koogMessage(b64t, b64d) {
