@@ -117,6 +117,18 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
         runJs("koogMessage('${b64(title)}', '${b64(detail)}')")
     }
 
+    /**
+     * Highlight a node (by its display label) and/or an edge (by its from/to Mermaid ids)
+     * in the diagram; pass all-null to clear. No-op until the page has loaded — the caret
+     * that drives this re-fires, so a dropped early call self-corrects.
+     */
+    fun highlight(node: String?, from: String?, to: String?) {
+        if (browser == null || !pageReady) return
+        exec("koogHighlight(${jsArg(node)}, ${jsArg(from)}, ${jsArg(to)})")
+    }
+
+    private fun jsArg(s: String?): String = if (s == null) "null" else "'${b64(s)}'"
+
     /** Run JS in the page now, or queue it (latest wins) until the page has loaded. */
     private fun runJs(js: String) {
         if (browser == null) return
@@ -171,19 +183,49 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
 
                 function koogBindNodes() {
                   document.querySelectorAll('g.node').forEach(function (n) {
+                    var l = n.querySelector('.nodeLabel, text');
+                    var id = ((l ? l.textContent : n.textContent) || '').trim();
+                    if (id) window.__koogNodeMap[id] = n;
                     n.addEventListener('click', function () {
-                      var l = n.querySelector('.nodeLabel, text');
-                      var id = ((l ? l.textContent : n.textContent) || '').trim();
                       if (id) __koogNodeClick(id);
                     });
                   });
-                  document.querySelectorAll('g.cluster').forEach(function (c) {
+                  // Subgraphs are composite states: in mermaid's state renderer their
+                  // group carries 'statediagram-cluster' (not the flowchart 'cluster'),
+                  // with the title in '.cluster-label' and the box in 'rect.outer/.inner'.
+                  document.querySelectorAll('g.cluster, g.statediagram-cluster').forEach(function (c) {
                     var l = c.querySelector('.cluster-label, text');
                     if (!l) return;
+                    var id = (l.textContent || '').trim();
+                    if (!id) return;
+                    window.__koogNodeMap[id] = c;
+                    var dataId = c.getAttribute('data-id');
+                    if (dataId) window.__koogNodeMap[dataId] = c;
                     l.style.cursor = 'pointer';
-                    l.addEventListener('click', function (ev) {
-                      var id = (l.textContent || '').trim();
-                      if (id) __koogNodeClick(id);
+
+                    // The whole header strip navigates — not just the title text. We can't
+                    // overlay a rect (a sibling after the label's foreignObject would hide
+                    // the HTML title in Chromium), so we listen on the cluster group and only
+                    // act when the click falls in the title band. Inner nodes live in a
+                    // separate group, so their clicks never bubble here.
+                    var box = c.querySelector('rect.outer') || c.querySelector('rect');
+                    var headerHeight;
+                    try { headerHeight = l.getBBox().height + 12; } catch (e) { headerHeight = 24; }
+                    c.addEventListener('click', function (ev) {
+                      if (box) {
+                        var svg = c.ownerSVGElement, ctm = c.getScreenCTM();
+                        if (svg && ctm) {
+                          var pt = svg.createSVGPoint();
+                          pt.x = ev.clientX; pt.y = ev.clientY;
+                          var p = pt.matrixTransform(ctm.inverse());
+                          var x = parseFloat(box.getAttribute('x')) || 0;
+                          var y = parseFloat(box.getAttribute('y')) || 0;
+                          var w = parseFloat(box.getAttribute('width')) || 0;
+                          var inHeader = p.x >= x && p.x <= x + w && p.y >= y && p.y <= y + headerHeight;
+                          if (!inHeader) return;
+                        }
+                      }
+                      __koogNodeClick(id);
                       ev.stopPropagation();
                     });
                   });
@@ -220,11 +262,17 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                       p.style.strokeWidth = p.dataset.koogSw || '';
                       p.style.filter = '';
                     });
+                    window.__koogEdgeMap[from + '|' + to] = p;
                     p.parentNode.insertBefore(hit, p.nextSibling);
                   });
                 }
 
-                function koogBindClicks() { koogBindNodes(); koogBindEdges(); }
+                function koogBindClicks() {
+                  window.__koogNodeMap = {};
+                  window.__koogEdgeMap = {};
+                  koogBindNodes();
+                  koogBindEdges();
+                }
             """.trimIndent()
         } ?: "function koogBindClicks() {}"
 
@@ -245,8 +293,15 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 /* Let clicks on a condition label fall through to the edge beneath it. */
                 g.edgeLabels { pointer-events: none; }
                 .msg h3 { margin: 0 0 8px; font-weight: 600; }
-                .msg .detail { white-space: pre-wrap; color: #c0392b; font-family: monospace;
+                .msg .detail { white-space: pre-wrap; color: $fg; opacity: 0.8;
+                  font-family: monospace; font-size: 12px; }
+                .error { white-space: pre-wrap; color: #c0392b; font-family: monospace;
                   font-size: 12px; }
+                /* Caret-driven highlight of the node/edge under the editor cursor. */
+                .koog-hl rect, .koog-hl polygon, .koog-hl circle, .koog-hl ellipse, .koog-hl path {
+                  stroke: #4c9aff !important; stroke-width: 3px !important; }
+                path.koog-hl-edge { stroke: #4c9aff !important; stroke-width: 3.5px !important;
+                  filter: drop-shadow(0 0 2px #4c9aff) !important; }
               </style>
             </head>
             <body>
@@ -279,9 +334,10 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                     root.innerHTML = res.svg;
                     if (res.bindFunctions) res.bindFunctions(root);
                     koogBindClicks();
+                    koogApplyHighlight();
                   }).catch(function (e) {
                     document.getElementById('root').innerHTML =
-                      '<pre class="detail">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
+                      '<pre class="error">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
                   });
                 }
                 function koogMessage(b64t, b64d) {
@@ -290,6 +346,35 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                   if (d) h += '<pre class="detail">' + __esc(d) + '</pre>';
                   h += '</div>';
                   document.getElementById('root').innerHTML = h;
+                }
+
+                // Caret-driven highlight. The desired target is remembered in __koogWant
+                // so it survives a re-render (the .then above re-applies it).
+                window.__koogWant = null;
+                window.__koogHi = [];
+                function koogHighlight(b64n, b64f, b64t) {
+                  window.__koogWant = {
+                    node: b64n ? __b64(b64n) : null,
+                    from: b64f ? __b64(b64f) : null,
+                    to:   b64t ? __b64(b64t) : null
+                  };
+                  koogApplyHighlight();
+                }
+                function koogApplyHighlight() {
+                  (window.__koogHi || []).forEach(function (el) {
+                    el.classList.remove('koog-hl'); el.classList.remove('koog-hl-edge');
+                  });
+                  window.__koogHi = [];
+                  var w = window.__koogWant; if (!w) return;
+                  var nm = window.__koogNodeMap || {}, em = window.__koogEdgeMap || {};
+                  if (w.node && nm[w.node]) {
+                    var el = nm[w.node]; el.classList.add('koog-hl'); window.__koogHi.push(el);
+                    try { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (e) {}
+                  }
+                  if (w.from && w.to) {
+                    var p = em[w.from + '|' + w.to];
+                    if (p) { p.classList.add('koog-hl-edge'); window.__koogHi.push(p); }
+                  }
                 }
               </script>
             </body>

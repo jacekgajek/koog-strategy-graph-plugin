@@ -65,12 +65,32 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
         add(buildToolbarStrip(), BorderLayout.NORTH)
     }
 
-    /** A thin top strip carrying the right-aligned "copy Mermaid code" toolbar button. */
+    /**
+     * Invoked (on the EDT) when the user clicks the detach button. When null the button
+     * is hidden — set it only on graphs that can be popped into their own window.
+     */
+    var onDetach: (() -> Unit)? = null
+
+    /** A thin top strip carrying the right-aligned detach + "copy Mermaid code" buttons. */
     private fun buildToolbarStrip(): JComponent {
-        val group = DefaultActionGroup(CopyMermaidAction())
+        val group = DefaultActionGroup(DetachAction(), CopyMermaidAction())
         val toolbar = ActionManager.getInstance().createActionToolbar("KoogStrategyDiagram", group, true)
         toolbar.targetComponent = this
         return JPanel(BorderLayout()).apply { add(toolbar.component, BorderLayout.EAST) }
+    }
+
+    private inner class DetachAction : AnAction(
+        "Detach to Window", "Move this graph into a separate, floating window", AllIcons.Actions.MoveToWindow,
+    ) {
+        override fun actionPerformed(e: AnActionEvent) {
+            onDetach?.invoke()
+        }
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isVisible = onDetach != null
+        }
+
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
     }
 
     private inner class CopyMermaidAction : AnAction(
@@ -103,6 +123,9 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
     }
 
     fun showMessage(title: String, detail: String) = view.showMessage(title, detail)
+
+    /** Highlight (or clear, when all-null) the node/edge matching the editor caret. */
+    fun highlight(node: String?, from: String?, to: String?) = view.highlight(node, from, to)
 
     fun setProblems(problems: List<Problem>) {
         model.set(problems)

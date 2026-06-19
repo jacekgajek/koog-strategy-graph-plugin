@@ -16,6 +16,17 @@ class StrategyParser {
         return call.lambdaArguments.isNotEmpty()
     }
 
+    /**
+     * The strategy's declared name (its first string-literal argument), or null if this
+     * isn't a strategy call. Cheap: reads only the first argument, no body traversal.
+     */
+    fun strategyName(call: KtCallExpression): String? {
+        if (!looksLikeStrategyCall(call)) return null
+        return (call.valueArguments.firstOrNull()?.getArgumentExpression() as? KtStringTemplateExpression)
+            ?.entries
+            ?.joinToString("") { it.text }
+    }
+
     fun parse(call: KtCallExpression): StrategyGraph? {
         if (!looksLikeStrategyCall(call)) return null
 
@@ -23,10 +34,7 @@ class StrategyParser {
         val inputType = typeArgs.getOrNull(0)?.typeReference?.text
         val outputType = typeArgs.getOrNull(1)?.typeReference?.text
 
-        val name = (call.valueArguments.firstOrNull()?.getArgumentExpression() as? KtStringTemplateExpression)
-            ?.entries
-            ?.joinToString("") { it.text }
-            ?: "<unnamed>"
+        val name = strategyName(call) ?: "<unnamed>"
 
         val body = call.lambdaArguments
             .firstOrNull()

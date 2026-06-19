@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
+import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtProperty
 
 /**
@@ -118,7 +119,7 @@ data class StrategySnippet(
                     if (fnName == null || member.receiverTypeReference != null) {
                         call.text // extension/anonymous — can't call simply
                     } else {
-                        val args = member.valueParameters.joinToString(", ") { "io.mockk.mockk(relaxed = true)" }
+                        val args = member.valueParameters.joinToString(", ") { mockArg(it) }
                         "$prefix$fnName($args)"
                     }
                 }
@@ -158,7 +159,7 @@ data class StrategySnippet(
                     if (owner.typeParameters.isNotEmpty()) return null
                     val ctor = owner.primaryConstructor
                     if (ctor != null && ctor.hasModifier(KtTokens.PRIVATE_KEYWORD)) return null
-                    val args = (ctor?.valueParameters ?: emptyList()).joinToString(", ") { "io.mockk.mockk(relaxed = true)" }
+                    val args = (ctor?.valueParameters ?: emptyList()).joinToString(", ") { mockArg(it) }
                     "$name($args)"
                 }
                 else -> null
@@ -180,6 +181,28 @@ data class StrategySnippet(
                 el = el.parent
             }
             return candidate
+        }
+
+        /**
+         * A value to pass for a synthesized constructor/function argument. mockk can't
+         * proxy `String` or the primitive types (it fails with "Can't instantiate proxy
+         * for class kotlin.String"), so we hand those a literal default; any nullable
+         * parameter just gets `null`. Everything else gets a relaxed mock. The values are
+         * never really used — node bodies aren't executed while building the graph.
+         */
+        private fun mockArg(param: KtParameter): String {
+            val type = param.typeReference?.text?.trim()
+            if (type != null && type.endsWith("?")) return "null"
+            return when (type?.substringAfterLast('.')?.substringBefore('<')?.trim()) {
+                "String", "CharSequence" -> "\"\""
+                "Int", "Short", "Byte" -> "0"
+                "Long" -> "0L"
+                "Double" -> "0.0"
+                "Float" -> "0.0f"
+                "Boolean" -> "false"
+                "Char" -> "' '"
+                else -> "io.mockk.mockk(relaxed = true)"
+            }
         }
 
         private fun strategyName(call: KtCallExpression): String? {
