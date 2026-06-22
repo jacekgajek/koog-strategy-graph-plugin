@@ -24,13 +24,16 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowManager
+import com.intellij.psi.PsiComment
 import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
+import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.SmartPointerManager
 import com.intellij.psi.SmartPsiElementPointer
 import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.psi.KtBinaryExpression
+import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtNamedFunction
@@ -127,9 +130,11 @@ class KoogGraphService(private val project: Project) : Disposable {
     }
 
     /**
-     * Memoizes outcomes by the strategy expression's own text. The strategy fully
-     * determines the diagram, so an unchanged strategy re-renders instantly (no
-     * compile/run) even after the per-tab key is evicted. LRU-bounded; EDT only.
+     * Memoizes outcomes by the [canonicalKey] of the strategy expression together with its
+     * containing file (whitespace and comments stripped) — the file is included because the
+     * diagram can depend on same-file helper functions the strategy references. An unchanged
+     * strategy/file — or one that was only reformatted — re-renders instantly (no compile/run)
+     * even after the per-tab key is evicted. LRU-bounded; EDT only.
      */
     private val cache = object : LinkedHashMap<String, MermaidExporter.ExportOutcome>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: Map.Entry<String, MermaidExporter.ExportOutcome>) = size > CACHE_SIZE
@@ -447,7 +452,14 @@ class KoogGraphService(private val project: Project) : Disposable {
             val key = runReadActionBlocking {
                 val call = ptr.element ?: return@runReadActionBlocking null
                 if (!call.isValid) return@runReadActionBlocking null
-                call.text
+                // The diagram also depends on same-file helpers the strategy references
+                // (e.g. `node("…")` factory functions), so key on the whole containing file,
+                // not just the strategy expression — otherwise editing a helper's node name
+                // wouldn't refresh. The expression text disambiguates sibling strategies in
+                // the same file (their file text is identical) so they don't collide in the
+                // shared cache. Both parts are canonicalized, so whitespace/comment-only
+                // edits still short-circuit.
+                canonicalKey(call) + " " + canonicalKey(call.containingFile)
             }
             if (key == null) {
                 LOG.info("render #$gen: strategy gone / invalid — keeping current view")
@@ -455,7 +467,7 @@ class KoogGraphService(private val project: Project) : Disposable {
                 return
             }
 
-            // The strategy itself hasn't changed (only the rest of the file) — nothing to do.
+            // Nothing meaningful changed in the strategy or its file — nothing to do.
             if (key == lastKey && hasDiagram) {
                 LOG.info("render #$gen: strategy unchanged — skipping")
                 return
@@ -467,29 +479,45 @@ class KoogGraphService(private val project: Project) : Disposable {
                 return
             }
 
-            val prepared = runReadActionBlocking {
-                val call = ptr.element ?: return@runReadActionBlocking null
-                if (!call.isValid) return@runReadActionBlocking null
-                MermaidExporter.prepare(call)
-            }
-            if (prepared == null) {
-                LOG.info("render #$gen: prepare returned null (strategy gone / not in a module) — keeping current view")
-                if (!hasDiagram) view.showMessage("Cannot generate diagram", "The strategy is not inside a resolvable module, or the module isn't built yet.")
-                return
-            }
-
             if (!hasDiagram) view.showMessage("Generating diagram…", "")
+            view.setRefreshing(true)
             ApplicationManager.getApplication().executeOnPooledThread {
-                // Guard everything: an exception here must never leave the view stuck on "Generating…".
-                val outcome = try {
-                    MermaidExporter.run(prepared)
+                // prepare() walks PSI and resolves cross-file references, which can be slow;
+                // run it here under a background read action rather than on the EDT (where a
+                // blocking read action would freeze the UI).
+                val prepared = try {
+                    runReadActionBlocking {
+                        val call = ptr.element ?: return@runReadActionBlocking null
+                        if (!call.isValid) return@runReadActionBlocking null
+                        MermaidExporter.prepare(call)
+                    }
                 } catch (t: Throwable) {
-                    LOG.warn("render #$gen: export threw", t)
-                    MermaidExporter.ExportOutcome(prepared.name, null, listOf(MermaidExporter.Problem("Diagram generation failed", t.toString())), cacheable = false)
+                    LOG.warn("render #$gen: prepare threw", t)
+                    null
+                }
+                // Guard everything: an exception here must never leave the view stuck on "Generating…".
+                val outcome = when {
+                    prepared == null -> {
+                        LOG.info("render #$gen: prepare returned null (strategy gone / not in a module) — keeping current view")
+                        null
+                    }
+                    else -> try {
+                        MermaidExporter.run(prepared)
+                    } catch (t: Throwable) {
+                        LOG.warn("render #$gen: export threw", t)
+                        MermaidExporter.ExportOutcome(prepared.name, null, listOf(MermaidExporter.Problem("Diagram generation failed", t.toString())), cacheable = false)
+                    }
                 }
                 ApplicationManager.getApplication().invokeLater {
                     if (project.isDisposed || gen != generation) {
+                        // A newer render is in flight (or we're disposed); it owns the
+                        // indicator now, so leave it to clear when it finishes.
                         LOG.info("render #$gen: result discarded (stale=${gen != generation}, disposed=${project.isDisposed})")
+                        return@invokeLater
+                    }
+                    view.setRefreshing(false)
+                    if (outcome == null) {
+                        if (!hasDiagram) view.showMessage("Cannot generate diagram", "The strategy is not inside a resolvable module, or the module isn't built yet.")
                         return@invokeLater
                     }
                     if (outcome.cacheable) cache[key] = outcome
@@ -573,10 +601,9 @@ class KoogGraphService(private val project: Project) : Disposable {
          * (edge click), and falls back to the variable name.
          */
         private fun resolveNodeProperty(call: KtCallExpression, token: String): KtProperty? {
-            val file = call.containingFile
             return PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java).firstOrNull { prop ->
                 if (!prop.hasDelegateExpression()) return@firstOrNull false
-                val display = nodeDisplayName(prop, file)
+                val display = nodeDisplayName(prop)
                 val name = prop.name
                 display == token || display.toMermaidId() == token ||
                     name == token || (name != null && name.toMermaidId() == token)
@@ -585,24 +612,32 @@ class KoogGraphService(private val project: Project) : Disposable {
 
         /**
          * The display name Koog gives a node: the explicit `name`/string argument of its
-         * delegate, or — when the delegate is a same-file helper function — the name of
-         * the `node(…)` built inside that helper; otherwise the property name.
+         * delegate, or — when the delegate calls a factory function — the name of the
+         * `node(…)` built inside that helper; otherwise the property name. The factory is
+         * resolved by reference, so it works whether it's a same-file function or one in
+         * another file (e.g. `Obj.makeNode()`).
          */
-        private fun nodeDisplayName(prop: KtProperty, file: PsiFile): String {
+        private fun nodeDisplayName(prop: KtProperty): String {
             val name = prop.name ?: ""
-            val delegate = prop.delegateExpression as? KtCallExpression ?: return name
-            explicitNodeName(delegate)?.let { return it }
+            val delegateCall = delegateCallOf(prop) ?: return name
+            explicitNodeName(delegateCall)?.let { return it }
 
-            val fnName = (delegate.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
-                ?: return name
-            val fn = PsiTreeUtil.findChildrenOfType(file, KtNamedFunction::class.java)
-                .firstOrNull { it.name == fnName } ?: return name
+            val fn = (delegateCall.calleeExpression as? KtNameReferenceExpression)
+                ?.reference?.resolve() as? KtNamedFunction ?: return name
             return PsiTreeUtil.findChildrenOfType(fn, KtCallExpression::class.java)
                 .firstNotNullOfOrNull { c ->
                     val callee = (c.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
                     if (callee?.startsWith("node") == true) explicitNodeName(c) else null
                 } ?: name
         }
+
+        /** The call a delegate ultimately makes: `foo()` directly, or the `foo()` in `Receiver.foo()`. */
+        private fun delegateCallOf(prop: KtProperty): KtCallExpression? =
+            when (val d = prop.delegateExpression) {
+                is KtCallExpression -> d
+                is KtDotQualifiedExpression -> d.selectorExpression as? KtCallExpression
+                else -> null
+            }
 
         /** The string passed as `name = "…"` or the first positional string literal, if any. */
         private fun explicitNodeName(call: KtCallExpression): String? {
@@ -660,7 +695,6 @@ class KoogGraphService(private val project: Project) : Disposable {
          * inner edge would resolve to (and highlight) the surrounding subgraph node.
          */
         private fun highlightFor(call: KtCallExpression, offset: Int): Highlight {
-            val file = call.containingFile
             val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
                 .filter { it.hasDelegateExpression() && it.textRange.contains(offset) }
                 .minByOrNull { it.textRange.length }
@@ -682,17 +716,16 @@ class KoogGraphService(private val project: Project) : Disposable {
                     return Highlight(node = null, from = mermaidIdForVar(call, from), to = mermaidIdForVar(call, to))
                 }
             }
-            if (prop != null) return Highlight(node = nodeDisplayName(prop, file), from = null, to = null)
+            if (prop != null) return Highlight(node = nodeDisplayName(prop), from = null, to = null)
             return Highlight(null, null, null)
         }
 
         /** The Mermaid edge-endpoint id for a Kotlin variable used in a `forwardTo`. */
         private fun mermaidIdForVar(call: KtCallExpression, varName: String): String {
             if (varName == "nodeStart" || varName == "nodeFinish") return varName
-            val file = call.containingFile
             val prop = PsiTreeUtil.findChildrenOfType(call, KtProperty::class.java)
                 .firstOrNull { it.name == varName }
-            val display = prop?.let { nodeDisplayName(it, file) } ?: varName
+            val display = prop?.let { nodeDisplayName(it) } ?: varName
             return display.toMermaidId()
         }
 
@@ -708,6 +741,35 @@ class KoogGraphService(private val project: Project) : Disposable {
     companion object {
         private val LOG = logger<KoogGraphService>()
         const val TOOL_WINDOW_ID = "Koog Strategy"
+
+        /**
+         * A canonical form of a strategy expression used as the diagram cache key: every
+         * run of insignificant whitespace and every comment is dropped, so edits that only
+         * reformat the code (or touch comments) collapse to the same key and re-use the
+         * cached diagram instead of triggering a recompile. Whitespace *inside* a string or
+         * char literal is part of that literal's leaf token (not a [PsiWhiteSpace]), so it
+         * is preserved — e.g. renaming a node label still invalidates the cache. Non-leaf
+         * tokens are joined with a single space so distinct tokens never merge (`a  b` and
+         * `a b` match, but `ab` stays distinct). Must be called under a read action.
+         */
+        private fun canonicalKey(element: PsiElement): String {
+            val sb = StringBuilder()
+            fun walk(e: PsiElement) {
+                var child = e.firstChild
+                if (child == null) { // leaf token
+                    if (e is PsiWhiteSpace || e is PsiComment) return
+                    if (sb.isNotEmpty()) sb.append(' ')
+                    sb.append(e.text)
+                    return
+                }
+                while (child != null) {
+                    walk(child)
+                    child = child.nextSibling
+                }
+            }
+            walk(element)
+            return sb.toString()
+        }
 
         // Each edit triggers a recompile; wait longer than a single keystroke burst.
         private const val REFRESH_DELAY_MS = 1500

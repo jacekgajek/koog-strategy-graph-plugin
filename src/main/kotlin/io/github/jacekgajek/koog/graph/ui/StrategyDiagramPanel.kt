@@ -124,6 +124,9 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
 
     fun showMessage(title: String, detail: String) = view.showMessage(title, detail)
 
+    /** Show/hide the unobtrusive refresh indicator on the canvas while a render is in flight. */
+    fun setRefreshing(refreshing: Boolean) = view.setRefreshing(refreshing)
+
     /** Highlight (or clear, when all-null) the node/edge matching the editor caret. */
     fun highlight(node: String?, from: String?, to: String?) = view.highlight(node, from, to)
 
