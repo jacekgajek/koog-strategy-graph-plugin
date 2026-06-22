@@ -118,6 +118,17 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
     }
 
     /**
+     * Toggle a small, static gray hourglass in the top-left corner of the canvas while a
+     * refresh is in flight. Deliberately unobtrusive — the previous diagram stays fully
+     * visible underneath. No-op until the page has loaded (a refresh only happens once a
+     * diagram is on screen, so the indicator is moot before then).
+     */
+    fun setRefreshing(refreshing: Boolean) {
+        if (browser == null || !pageReady) return
+        exec("koogLoading($refreshing)")
+    }
+
+    /**
      * Highlight a node (by its display label) and/or an edge (by its from/to Mermaid ids)
      * in the diagram; pass all-null to clear. No-op until the page has loaded — the caret
      * that drives this re-fires, so a dropped early call self-corrects.
@@ -306,6 +317,14 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
             </head>
             <body>
               <div id="root"></div>
+              <!-- Refresh indicator: a static gray hourglass, hidden unless a render is in flight. -->
+              <div id="koog-loading" title="Refreshing…" aria-hidden="true"
+                style="position: fixed; top: 6px; left: 6px; display: none; opacity: 0.45;
+                       pointer-events: none; z-index: 10;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="#808080">
+                  <path d="M6 2 L18 2 L18 7 L12 12 L18 17 L18 22 L6 22 L6 17 L12 12 L6 7 Z"/>
+                </svg>
+              </div>
               <script src="mermaid.min.js"></script>
               <script>
                 $clickJs
@@ -339,6 +358,11 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                     document.getElementById('root').innerHTML =
                       '<pre class="error">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
                   });
+                }
+                // Show/hide the static refresh hourglass in the corner.
+                function koogLoading(show) {
+                  var el = document.getElementById('koog-loading');
+                  if (el) el.style.display = show ? 'block' : 'none';
                 }
                 function koogMessage(b64t, b64d) {
                   var t = __b64(b64t), d = __b64(b64d);

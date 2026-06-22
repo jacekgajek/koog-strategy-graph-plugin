@@ -2,15 +2,21 @@ package io.github.jacekgajek.koog.graph.export
 
 import com.intellij.execution.configurations.GeneralCommandLine
 import com.intellij.execution.process.CapturingProcessHandler
+import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.module.Module
 import com.intellij.openapi.module.ModuleUtilCore
+import com.intellij.openapi.projectRoots.JavaSdk
 import com.intellij.openapi.roots.CompilerModuleExtension
 import com.intellij.openapi.roots.ModuleRootManager
 import com.intellij.openapi.roots.OrderEnumerator
+import com.intellij.openapi.roots.ProjectFileIndex
 import com.intellij.openapi.util.io.FileUtil
 import com.intellij.util.PathUtil
+import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.kotlin.psi.KtCallExpression
+import org.jetbrains.kotlin.psi.KtFile
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
@@ -36,12 +42,16 @@ object MermaidExporter {
     private val LOG = logger<MermaidExporter>()
 
     private const val K2_COMPILER = "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler"
-    // Koog's inline DSL functions are compiled to JVM target 17; kotlinc defaults to
-    // 1.8, which refuses to inline newer bytecode. 17 also runs on any JDK >= 17,
-    // which every Koog project has.
+    // Fallback JVM target when the module SDK version can't be determined (see jvmTargetFor).
+    // 17 is Koog's floor: its inline DSL is compiled to 17, and kotlinc's own default of 1.8
+    // refuses to inline that newer bytecode. The real target is usually the module SDK's, so
+    // we can also inline dependencies built for a newer JVM.
     private const val JVM_TARGET = "17"
     private const val COMPILE_TIMEOUT_MS = 120_000
     private const val RUN_TIMEOUT_MS = 60_000
+
+    /** Cap on referenced same-module files pulled into a single compile (see [collectReferencedSources]). */
+    private const val MAX_EXTRA_SOURCES = 64
 
     /** Everything needed to compile + run, captured off the PSI under a read action. */
     class Prepared(
@@ -53,7 +63,20 @@ object MermaidExporter {
         val mainClass: String,
         /** Module output dir(s) passed via -Xfriend-paths so `internal` symbols resolve. */
         val friendPaths: List<String>,
+        /** JVM bytecode target for the compile, derived from the module SDK (floored at 17). */
+        val jvmTarget: String,
+        /**
+         * Lazily resolves same-module source files the strategy references from *other* files
+         * (e.g. node factories in a separate object). Invoked only as a fallback, when the
+         * snippet-only compile fails on unresolved references — i.e. the module isn't built —
+         * so a built module never pays the resolution or extra-compile cost. Runs its own
+         * read action.
+         */
+        val extraSources: () -> List<ExtraSource>,
     )
+
+    /** An extra source file pulled into the compile: a unique runner-local name + its text. */
+    class ExtraSource(val fileName: String, val content: String)
 
     /** A single row for the Problems-style table. */
     data class Problem(val message: String, val detail: String? = null)
@@ -108,17 +131,84 @@ object MermaidExporter {
         val classpath = (orderClasspath + outputs).distinct()
         val friendPaths = outputs
 
+        // The snippet copies only the strategy's own file verbatim; helpers it references
+        // from *other* same-module files (e.g. a `node("…")` factory object) only resolve
+        // from the module's compiled output — often absent for Gradle-delegated builds. When
+        // that happens the snippet-only compile fails on unresolved references and we fall
+        // back to pulling those files in as source (resolved lazily, only then).
+        val strategyFile = call.containingFile as? KtFile
+        val extraSources: () -> List<ExtraSource> = provider@{
+            val f = strategyFile ?: return@provider emptyList()
+            runReadAction { if (f.isValid) collectReferencedSources(f, module) else emptyList() }
+        }
+        val jvmTarget = jvmTargetFor(module)
+
         LOG.info(
             "prepare: strategy='${snippet.name}', module='${module.name}', " +
                 "classpath=${classpath.size} entries (orderEntries=${orderClasspath.size}, outputs=${outputs.size}), " +
                 "sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
                 "javaExe=$javaExe, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
-                "snippet=${snippet.source.length} chars",
+                "jvmTarget=$jvmTarget, snippet=${snippet.source.length} chars",
         )
         if (outputs.isEmpty()) {
             LOG.warn("prepare: no module output dir found — same-package siblings may not resolve; build the module")
         }
-        return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths)
+        return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths, jvmTarget, extraSources)
+    }
+
+    /**
+     * The JVM bytecode target to compile the snippet with. Derived from the module's SDK so
+     * we can inline bytecode from dependencies built for that JDK (a hardcoded 17 fails when
+     * a dependency targets a newer JVM). Floored at 17, which Koog's inline DSL requires.
+     */
+    private fun jvmTargetFor(module: Module): String {
+        val sdk = ModuleRootManager.getInstance(module).sdk ?: return JVM_TARGET
+        val feature = JavaSdk.getInstance().getVersion(sdk)?.maxLanguageLevel?.feature()
+            ?: sdk.versionString?.let(::parseJavaFeature)
+            ?: return JVM_TARGET
+        return maxOf(feature, 17).toString()
+    }
+
+    /** Best-effort Java feature version from an SDK version string ("1.8" → 8, "25.0.1" → 25). */
+    private fun parseJavaFeature(versionString: String): Int? {
+        val m = Regex("""(?<!\d)(1\.)?(\d{1,2})(?!\d)""").find(versionString) ?: return null
+        return m.groupValues[2].toIntOrNull()
+    }
+
+    /**
+     * Transitively collect the same-module Kotlin source files that [start] (the strategy's
+     * file) references — node factories, helper objects, types, etc. defined in other files.
+     * Resolution is syntactic-best-effort via PSI references; anything that resolves into a
+     * library (no module) or back into [start] is ignored. Bounded by [MAX_EXTRA_SOURCES] so
+     * a densely-connected module can't drag the whole source tree into one compile.
+     * Must be called under a read action.
+     */
+    private fun collectReferencedSources(start: KtFile, module: Module): List<ExtraSource> {
+        val fileIndex = ProjectFileIndex.getInstance(module.project)
+        val visited = hashSetOf(start)
+        val collected = ArrayList<KtFile>()
+        val queue = ArrayDeque<KtFile>().apply { add(start) }
+        while (queue.isNotEmpty() && collected.size < MAX_EXTRA_SOURCES) {
+            val file = queue.removeFirst()
+            for (ref in PsiTreeUtil.collectElementsOfType(file, KtNameReferenceExpression::class.java)) {
+                val target = ref.reference?.resolve()?.containingFile as? KtFile ?: continue
+                if (!visited.add(target)) continue
+                val vf = target.virtualFile ?: continue
+                // Editable project source only: never a library or a decompiled `.class`
+                // stub (whose `/* compiled code */` body would crash the compiler), and
+                // scoped to this module so we don't drag in unrelated modules.
+                if (vf.extension != "kt" || !fileIndex.isInSourceContent(vf)) continue
+                if (ModuleUtilCore.findModuleForPsiElement(target) !== module) continue
+                collected.add(target)
+                queue.add(target)
+                if (collected.size >= MAX_EXTRA_SOURCES) break
+            }
+        }
+        return collected.mapIndexed { i, f ->
+            val base = f.virtualFile?.name?.takeIf { it.endsWith(".kt") } ?: "Ref$i.kt"
+            // Prefix with the index so two files of the same simple name never collide on disk.
+            ExtraSource("extra${i}_$base", f.text)
+        }
     }
 
     /**
@@ -184,15 +274,21 @@ object MermaidExporter {
         LOG.info("run: ${mockk.size} bundled mockk jars")
         val compileClasspath = prepared.moduleClasspath + compilerJars + mockk
 
-        // Prefer the warm daemon (run with the IDE's JRE; bytecode target is fixed by
-        // -jvm-target so it's independent of this JVM). Fall back to a cold one-shot.
-        val daemonJava = ideJavaExe()
+        // Pass 1: the snippet alone. For a built module everything it references is already
+        // on the classpath, so this resolves without dragging in (and recompiling) other
+        // files. Pass 2 (fallback): only when that fails on unresolved references — i.e. the
+        // module isn't built — pull the referenced same-module sources in and try again.
         var cr: CompilerDaemon.CompileResult? = null
         val compileMs = measureTimeMillis {
-            cr = CompilerDaemon.compile(daemonJava, compilerJars, srcFile, outDir, compileClasspath, JVM_TARGET, prepared.friendPaths)
-            if (cr == null) {
-                LOG.info("run: daemon unavailable — cold compile")
-                cr = coldCompile(prepared.javaExe, compilerJars, srcFile, outDir, compileClasspath, prepared.friendPaths, workDir)
+            cr = compile(prepared, compilerJars, listOf(srcFile), outDir, compileClasspath, workDir)
+            if (cr.let { it != null && it.exitCode != 0 && looksLikeMissingSymbols(it.diagnostics) }) {
+                val extraFiles = prepared.extraSources().map { es ->
+                    File(workDir, es.fileName).apply { writeText(es.content, StandardCharsets.UTF_8) }
+                }
+                if (extraFiles.isNotEmpty()) {
+                    LOG.info("run: snippet-only compile had unresolved refs — retrying with ${extraFiles.size} referenced file(s)")
+                    cr = compile(prepared, compilerJars, listOf(srcFile) + extraFiles, outDir, compileClasspath, workDir)
+                }
             }
         }
         val compile = cr
@@ -243,14 +339,40 @@ object MermaidExporter {
         return ExportOutcome(prepared.name, null, listOf(Problem("Ran, but no diagram was produced", detail)))
     }
 
+    /**
+     * Compile [srcFiles] with the warm daemon, falling back to a cold one-shot. The daemon
+     * runs with the IDE's JRE; the bytecode target is fixed by `prepared.jvmTarget`, so it's
+     * independent of that JVM. Returns null only on timeout / failure to start.
+     */
+    private fun compile(
+        prepared: Prepared,
+        compilerJars: List<String>,
+        srcFiles: List<File>,
+        outDir: File,
+        compileClasspath: List<String>,
+        workDir: File,
+    ): CompilerDaemon.CompileResult? {
+        val fromDaemon = CompilerDaemon.compile(
+            ideJavaExe(), compilerJars, srcFiles, outDir, compileClasspath, prepared.jvmTarget, prepared.friendPaths,
+        )
+        if (fromDaemon != null) return fromDaemon
+        LOG.info("run: daemon unavailable — cold compile")
+        return coldCompile(prepared.javaExe, compilerJars, srcFiles, outDir, compileClasspath, prepared.friendPaths, prepared.jvmTarget, workDir)
+    }
+
+    /** Whether a failed compile looks like missing classpath symbols (an unbuilt module). */
+    private fun looksLikeMissingSymbols(diagnostics: String): Boolean =
+        diagnostics.contains("unresolved reference", ignoreCase = true)
+
     /** One-shot fallback compile. Returns null on timeout / failure to start. */
     private fun coldCompile(
         javaExe: String,
         compilerJars: List<String>,
-        srcFile: File,
+        srcFiles: List<File>,
         outDir: File,
         compileClasspath: List<String>,
         friendPaths: List<String>,
+        jvmTarget: String,
         workDir: File,
     ): CompilerDaemon.CompileResult? {
         val cmd = GeneralCommandLine(javaExe).apply {
@@ -258,10 +380,10 @@ object MermaidExporter {
             addParameter(K2_COMPILER)
             addParameters("-classpath", compileClasspath.joinToString(File.pathSeparator))
             addParameters("-d", outDir.absolutePath)
-            addParameters("-jvm-target", JVM_TARGET)
+            addParameters("-jvm-target", jvmTarget)
             if (friendPaths.isNotEmpty()) addParameter("-Xfriend-paths=${friendPaths.joinToString(",")}")
             addParameters("-no-stdlib", "-no-reflect")
-            addParameter(srcFile.absolutePath)
+            srcFiles.forEach { addParameter(it.absolutePath) }
             charset = StandardCharsets.UTF_8
         }
         File(workDir, "compile-cmd.txt").writeText(cmd.commandLineString)

@@ -17,6 +17,28 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.6</h3>
+        <ul>
+            <li>Node factories defined in a <em>separate file</em> (e.g. a helper
+                <code>object</code>) are now supported: when the snippet-only compile can't
+                resolve them — typically an unbuilt module — the referenced same-module
+                sources are pulled into the compile, so the graph renders instead of failing.</li>
+            <li>The compile's JVM target is now taken from the module's SDK, so strategies in
+                modules whose dependencies target a newer JVM no longer fail with an
+                <em>"cannot inline bytecode built with JVM target …"</em> error.</li>
+            <li>Click-to-navigate and caret highlighting now follow node factories across
+                files (including <code>Receiver.factory()</code> calls), jumping to the
+                helper's declaration.</li>
+            <li>Navigating to a node/edge no longer recenters the editor when the target line
+                is already visible — it only scrolls when needed.</li>
+            <li>A small, unobtrusive gray hourglass appears in the corner of the diagram while
+                it is regenerating.</li>
+            <li>Reformatting-only edits (whitespace, comments) no longer trigger a re-render;
+                editing a same-file helper now does.</li>
+            <li>Performance: graph generation and the PSI work behind caret highlighting and
+                click navigation now run off the UI thread, so they no longer cause editor
+                hangs or slow-operation warnings.</li>
+        </ul>
         <h3>0.1.5</h3>
         <ul>
             <li>The tool window now has an always-visible list of every <code>strategy { }</code>
@@ -85,10 +107,11 @@
             factoryClass="io.github.jacekgajek.koog.graph.tool.KoogGraphToolWindowFactory"/>
     </extensions>
 
-    <!-- Both K1 and K2 modes of the Kotlin plugin are supported. We only walk
-         syntactic PSI (KtCallExpression, KtProperty, KtBinaryExpression) and
-         never call the Analysis API, so the same code runs unchanged in either
-         mode. Without this declaration K2 refuses to load the plugin. -->
+    <!-- Both K1 and K2 modes of the Kotlin plugin are supported. We walk syntactic
+         PSI (KtCallExpression, KtProperty, KtBinaryExpression) and resolve plain PSI
+         references (PsiReference.resolve), but never call the Analysis API — so the
+         same code runs unchanged in either mode. Without this declaration K2 refuses
+         to load the plugin. -->
     <extensions defaultExtensionNs="org.jetbrains.kotlin">
         <supportsKotlinPluginMode supportsK1="true" supportsK2="true"/>
     </extensions>

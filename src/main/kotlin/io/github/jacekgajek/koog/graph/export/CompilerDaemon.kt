@@ -29,7 +29,7 @@ object CompilerDaemon {
     @Volatile private var shutdownHookAdded = false
 
     /**
-     * Compile [srcFile] into [outDir] using the warm worker. Returns null if the
+     * Compile [srcFiles] into [outDir] using the warm worker. Returns null if the
      * daemon is unavailable (the caller should then fall back to a cold compile).
      * [javaExe] should be a JDK >= 17 (the IDE's own JRE is fine — the produced
      * bytecode target is controlled by [jvmTarget], independent of this JVM).
@@ -37,7 +37,7 @@ object CompilerDaemon {
     fun compile(
         javaExe: String,
         compilerJars: List<String>,
-        srcFile: File,
+        srcFiles: List<File>,
         outDir: File,
         classpath: List<String>,
         jvmTarget: String,
@@ -53,9 +53,10 @@ object CompilerDaemon {
                     appendLine(jvmTarget)
                     appendLine(friendPaths.joinToString(",")) // empty line if none
                     appendLine(diagFile.absolutePath)
-                    appendLine(srcFile.absolutePath)
                     appendLine(classpath.size.toString())
                     classpath.forEach { appendLine(it) }
+                    appendLine(srcFiles.size.toString())
+                    srcFiles.forEach { appendLine(it.absolutePath) }
                 },
                 StandardCharsets.UTF_8,
             )
