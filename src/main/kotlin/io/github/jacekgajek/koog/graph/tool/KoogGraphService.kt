@@ -12,11 +12,13 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.editor.Document
 import com.intellij.openapi.editor.EditorFactory
+import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.editor.event.CaretEvent
 import com.intellij.openapi.editor.event.CaretListener
 import com.intellij.openapi.editor.event.DocumentEvent
 import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.FrameWrapper
@@ -24,34 +26,19 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowManager
-import com.intellij.psi.PsiComment
-import com.intellij.psi.PsiDocumentManager
-import com.intellij.psi.PsiElement
-import com.intellij.psi.PsiFile
-import com.intellij.psi.PsiWhiteSpace
-import com.intellij.psi.SmartPointerManager
-import com.intellij.psi.SmartPsiElementPointer
+import com.intellij.psi.*
 import com.intellij.psi.util.PsiTreeUtil
-import org.jetbrains.kotlin.psi.KtBinaryExpression
-import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
-import org.jetbrains.kotlin.psi.KtExpression
-import org.jetbrains.kotlin.psi.KtNameReferenceExpression
-import org.jetbrains.kotlin.psi.KtNamedFunction
-import org.jetbrains.kotlin.psi.KtProperty
-import org.jetbrains.kotlin.psi.KtStringTemplateExpression
 import com.intellij.ui.JBSplitter
-import com.intellij.ui.content.Content
-import com.intellij.ui.content.ContentManager
-import com.intellij.ui.content.ContentManagerEvent
-import com.intellij.ui.content.ContentManagerListener
-import com.intellij.ui.content.ContentFactory
+import com.intellij.ui.content.*
 import com.intellij.util.Alarm
 import com.intellij.util.concurrency.AppExecutorUtil
 import io.github.jacekgajek.koog.graph.export.MermaidExporter
 import io.github.jacekgajek.koog.graph.index.StrategyIndex
+import io.github.jacekgajek.koog.graph.tool.KoogGraphService.Companion.canonicalKey
 import io.github.jacekgajek.koog.graph.ui.StrategyDiagramPanel
 import io.github.jacekgajek.koog.graph.ui.StrategyListPanel
-import org.jetbrains.kotlin.psi.KtCallExpression
+import org.jetbrains.kotlin.psi.*
+import java.util.concurrent.Callable
 
 /**
  * Mirrors Koog's `MermaidDiagramGenerator`: a node's diagram id is its display name with
@@ -332,7 +319,19 @@ class KoogGraphService(private val project: Project) : Disposable {
             scanOverview()
             return
         }
-        OpenFileDescriptor(project, target.first, target.second).navigate(true)
+        navigate(target.first, target.second)
+    }
+
+    /**
+     * Open [vf] and put the caret at [offset], scrolling only enough to bring it into view.
+     * Unlike [OpenFileDescriptor.navigate], this never re-centers an already-visible line, so
+     * navigating to a node/edge whose declaration is already on screen doesn't jolt the editor.
+     */
+    private fun navigate(vf: VirtualFile, offset: Int) {
+        val editor = FileEditorManager.getInstance(project)
+            .openTextEditor(OpenFileDescriptor(project, vf), true) ?: return
+        editor.caretModel.moveToOffset(offset)
+        editor.scrollingModel.scrollToCaret(ScrollType.MAKE_VISIBLE)
     }
 
     /** Open the graph for the strategy at [index] in the overview list. */
@@ -551,17 +550,20 @@ class KoogGraphService(private val project: Project) : Disposable {
          * from the Kotlin variable — so we map it back to the declaring property.
          */
         fun navigateToNode(id: String) {
-            val target = runReadActionBlocking {
-                val call = pointer?.element ?: return@runReadActionBlocking null
-                val prop = resolveNodeProperty(call, id) ?: return@runReadActionBlocking null
-                val vf = prop.containingFile.virtualFile ?: return@runReadActionBlocking null
+            // Off the EDT: resolveNodeProperty resolves (possibly cross-file) helper
+            // references, which can touch indexes — illegal on the EDT.
+            ReadAction.nonBlocking(Callable {
+                val call = pointer?.element ?: return@Callable null
+                val prop = resolveNodeProperty(call, id) ?: return@Callable null
+                val vf = prop.containingFile.virtualFile ?: return@Callable null
                 vf to prop.textOffset
-            }
-            if (target == null) {
-                LOG.info("navigateToNode: no declaration for node '$id' in the strategy")
-                return
-            }
-            OpenFileDescriptor(project, target.first, target.second).navigate(true)
+            })
+                .expireWith(view)
+                .finishOnUiThread(ModalityState.defaultModalityState()) { target ->
+                    if (target == null) LOG.info("navigateToNode: no declaration for node '$id' in the strategy")
+                    else navigate(target.first, target.second)
+                }
+                .submit(AppExecutorUtil.getAppExecutorService())
         }
 
         /**
@@ -570,23 +572,24 @@ class KoogGraphService(private val project: Project) : Disposable {
          * map each back to the Kotlin variable used in the `forwardTo` infix.
          */
         fun navigateToEdge(from: String, to: String) {
-            val target = runReadActionBlocking {
-                val call = pointer?.element ?: return@runReadActionBlocking null
+            ReadAction.nonBlocking(Callable {
+                val call = pointer?.element ?: return@Callable null
                 val fromVar = resolveVarName(call, from)
                 val toVar = resolveVarName(call, to)
                 val binary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
                     .firstOrNull {
                         it.operationReference.getReferencedName() == "forwardTo" &&
                             leadingName(it.left) == fromVar && leadingName(it.right) == toVar
-                    } ?: return@runReadActionBlocking null
-                val vf = binary.containingFile?.virtualFile ?: return@runReadActionBlocking null
+                    } ?: return@Callable null
+                val vf = binary.containingFile?.virtualFile ?: return@Callable null
                 vf to binary.textOffset
-            }
-            if (target == null) {
-                LOG.info("navigateToEdge: no 'edge($from forwardTo $to)' found in the strategy")
-                return
-            }
-            OpenFileDescriptor(project, target.first, target.second).navigate(true)
+            })
+                .expireWith(view)
+                .finishOnUiThread(ModalityState.defaultModalityState()) { target ->
+                    if (target == null) LOG.info("navigateToEdge: no 'edge($from forwardTo $to)' found in the strategy")
+                    else navigate(target.first, target.second)
+                }
+                .submit(AppExecutorUtil.getAppExecutorService())
         }
 
         /** The Kotlin variable behind a clicked edge endpoint id (or the id itself). */
@@ -624,6 +627,10 @@ class KoogGraphService(private val project: Project) : Disposable {
 
             val fn = (delegateCall.calleeExpression as? KtNameReferenceExpression)
                 ?.reference?.resolve() as? KtNamedFunction ?: return name
+            // Only read the name out of a *source* helper. Descending into a decompiled
+            // library function would force its stub/AST to load — a slow, index-touching
+            // operation — and library factories carry no user `node("…")` name anyway.
+            if (fn.containingKtFile.isCompiled) return name
             return PsiTreeUtil.findChildrenOfType(fn, KtCallExpression::class.java)
                 .firstNotNullOfOrNull { c ->
                     val callee = (c.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
@@ -674,16 +681,28 @@ class KoogGraphService(private val project: Project) : Disposable {
         /**
          * Reverse navigation: given the editor caret at [offset] in [vf], highlight the
          * node/edge under it in this tab's graph (or clear when the caret isn't on one).
-         * Cheap when the caret is in an unrelated file — no read action is taken.
+         * Cheap when the caret is in an unrelated file — no read action is taken. The PSI
+         * walk (which may resolve cross-file references) runs in a coalesced background read
+         * action, never on the EDT — caret moves are frequent and resolution can touch indexes.
          */
         fun highlightAtCaret(vf: VirtualFile?, offset: Int) {
-            val spec = if (currentFile != vf) Highlight(null, null, null)
-            else runReadActionBlocking {
-                val call = pointer?.element ?: return@runReadActionBlocking null
+            if (vf == null || currentFile != vf) {
+                applyHighlight(Highlight(null, null, null))
+                return
+            }
+            ReadAction.nonBlocking(Callable {
+                val call = pointer?.element ?: return@Callable null // strategy gone — leave it be
                 if (!call.isValid || !call.textRange.contains(offset)) Highlight(null, null, null)
                 else highlightFor(call, offset)
-            } ?: return // strategy gone — leave the current highlight be
-            if (spec == lastHighlight) return
+            })
+                .expireWith(view)
+                .coalesceBy(this, vf)
+                .finishOnUiThread(ModalityState.any(), ::applyHighlight)
+                .submit(AppExecutorUtil.getAppExecutorService())
+        }
+
+        private fun applyHighlight(spec: Highlight?) {
+            if (spec == null || spec == lastHighlight) return
             lastHighlight = spec
             view.highlight(spec.node, spec.from, spec.to)
         }
