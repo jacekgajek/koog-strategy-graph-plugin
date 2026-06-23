@@ -9,60 +9,59 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.util.Disposer
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.ui.JBColor
-import com.intellij.ui.JBSplitter
+import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.table.JBTable
 import com.intellij.util.ui.JBUI
-import io.github.jacekgajek.koog.graph.export.MermaidExporter.Problem
 import java.awt.BorderLayout
-import java.awt.Component
+import java.awt.CardLayout
+import java.awt.FlowLayout
 import java.awt.datatransfer.StringSelection
 import javax.swing.JComponent
 import javax.swing.JPanel
-import javax.swing.JTable
-import javax.swing.table.AbstractTableModel
-import javax.swing.table.DefaultTableCellRenderer
 
 /**
- * The tool-window content for one strategy: the Mermaid diagram on top and, when
- * generation reports problems, a Problems-style error table underneath. The last
- * good diagram stays visible while errors are shown.
+ * The tool-window content for one strategy: the Mermaid diagram in the canvas, plus error
+ * reporting that never obstructs a good diagram. While a diagram is on screen, errors are
+ * shown in a thin strip along the bottom (a compile-error "rebuild & refresh" hint, or a
+ * thrown graph error's message); the last good diagram stays put, so live edits don't flip
+ * the canvas back and forth between the graph and an error. Only when there is no diagram to
+ * keep does the error take over the whole canvas.
  */
 class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
 
     private val view = MermaidView()
-    private val model = ProblemsModel()
-    private val table = JBTable(model)
-    private val problemsComponent: JComponent
-    private val splitter = JBSplitter(true, 0.7f).apply { splitterProportionKey = "koog.graph.diagram.splitter" }
 
     /** The Mermaid source currently displayed; backs the copy-to-clipboard action. */
     private var currentMermaid: String? = null
 
+    // --- Bottom error strip: shown only when a diagram is already on the canvas. ---
+    private val bannerCards = CardLayout()
+    private val bannerCenter = JPanel(bannerCards)
+    private val bannerMessage = JBLabel()
+    private val banner = JPanel(BorderLayout()).apply {
+        border = JBUI.Borders.compound(
+            JBUI.Borders.customLine(JBColor.border(), 1, 0, 0, 0),
+            JBUI.Borders.empty(5, 8),
+        )
+        add(JBLabel(AllIcons.General.Error).apply { border = JBUI.Borders.emptyRight(6) }, BorderLayout.WEST)
+        add(bannerCenter, BorderLayout.CENTER)
+        isVisible = false
+    }
+
     init {
-        table.setShowGrid(false)
-        table.rowHeight = JBUI.scale(22)
-        table.intercellSpacing = JBUI.size(0, 0)
-        table.columnModel.getColumn(0).apply {
-            maxWidth = JBUI.scale(26); minWidth = JBUI.scale(26)
-            cellRenderer = SeverityIconRenderer()
+        val compileRow = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            add(JBLabel("There are compile errors. Rebuild your project and "))
+            add(ActionLink("refresh") { onRefresh() })
+            add(JBLabel("."))
         }
+        bannerCenter.add(compileRow, CARD_COMPILE)
+        bannerCenter.add(bannerMessage, CARD_MESSAGE)
 
-        val header = JBLabel(" Graph problems").apply {
-            border = JBUI.Borders.empty(4, 6)
-            foreground = JBColor.GRAY
-        }
-        problemsComponent = JPanel(BorderLayout()).apply {
-            add(header, BorderLayout.NORTH)
-            add(JBScrollPane(table), BorderLayout.CENTER)
-        }
-
-        splitter.firstComponent = view
-        splitter.secondComponent = null // hidden until there are problems
-        add(splitter, BorderLayout.CENTER)
+        add(view, BorderLayout.CENTER)
         add(buildToolbarStrip(), BorderLayout.NORTH)
+        add(banner, BorderLayout.SOUTH)
     }
 
     /**
@@ -70,6 +69,15 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
      * is hidden — set it only on graphs that can be popped into their own window.
      */
     var onDetach: (() -> Unit)? = null
+
+    /**
+     * Invoked (on the EDT) when the user clicks a "refresh" link shown for a compile error
+     * (in the bottom strip or the full-canvas notice). Wired by the owner to the same action
+     * as the tool-window refresh button.
+     */
+    var onRefresh: () -> Unit
+        get() = view.onRefresh
+        set(value) { view.onRefresh = value }
 
     /** A thin top strip carrying the right-aligned detach + "copy Mermaid code" buttons. */
     private fun buildToolbarStrip(): JComponent {
@@ -119,10 +127,51 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
 
     fun showDiagram(mermaid: String) {
         currentMermaid = mermaid
+        hideBanner()
         view.showDiagram(mermaid)
     }
 
-    fun showMessage(title: String, detail: String) = view.showMessage(title, detail)
+    fun showMessage(title: String, detail: String) {
+        hideBanner()
+        view.showMessage(title, detail)
+    }
+
+    /**
+     * Take over the whole canvas with the "There are compile errors. Rebuild your project and
+     * refresh." notice ("refresh" is a link). Used when there's no diagram to keep on screen;
+     * shown instead of the raw kotlinc diagnostics, whose temp-dir paths look like a plugin bug.
+     */
+    fun showCompileError() {
+        hideBanner()
+        view.showCompileError()
+    }
+
+    /** Show the compile-error hint in the bottom strip, leaving the current diagram on screen. */
+    fun showCompileErrorBanner() {
+        bannerCards.show(bannerCenter, CARD_COMPILE)
+        showBanner()
+    }
+
+    /** Show a graph/logical error's [message] in the bottom strip, keeping the diagram on screen. */
+    fun showErrorBanner(message: String) {
+        bannerMessage.text = "<html>${StringUtil.escapeXmlEntities(message)}</html>"
+        bannerMessage.toolTipText = message
+        bannerCards.show(bannerCenter, CARD_MESSAGE)
+        showBanner()
+    }
+
+    private fun showBanner() {
+        banner.isVisible = true
+        banner.revalidate()
+        banner.repaint()
+    }
+
+    private fun hideBanner() {
+        if (!banner.isVisible) return
+        banner.isVisible = false
+        banner.revalidate()
+        banner.repaint()
+    }
 
     /** Show/hide the unobtrusive refresh indicator on the canvas while a render is in flight. */
     fun setRefreshing(refreshing: Boolean) = view.setRefreshing(refreshing)
@@ -130,58 +179,10 @@ class StrategyDiagramPanel : JPanel(BorderLayout()), Disposable {
     /** Highlight (or clear, when all-null) the node/edge matching the editor caret. */
     fun highlight(node: String?, from: String?, to: String?) = view.highlight(node, from, to)
 
-    fun setProblems(problems: List<Problem>) {
-        model.set(problems)
-        val shouldShow = problems.isNotEmpty()
-        val showing = splitter.secondComponent != null
-        if (shouldShow && !showing) {
-            splitter.secondComponent = problemsComponent
-            splitter.proportion = 0.7f
-        } else if (!shouldShow && showing) {
-            splitter.secondComponent = null
-        }
-        splitter.revalidate()
-        splitter.repaint()
-    }
-
     override fun dispose() = Disposer.dispose(view)
 
-    private class ProblemsModel : AbstractTableModel() {
-        private var rows: List<Problem> = emptyList()
-        fun set(problems: List<Problem>) {
-            rows = problems
-            fireTableDataChanged()
-        }
-
-        fun problemAt(row: Int): Problem? = rows.getOrNull(row)
-        override fun getRowCount() = rows.size
-        override fun getColumnCount() = 2
-        override fun getColumnName(column: Int) = if (column == 0) "" else "Description"
-        override fun getValueAt(rowIndex: Int, columnIndex: Int): Any =
-            if (columnIndex == 0) "" else rows[rowIndex].message
-    }
-
-    private class SeverityIconRenderer : DefaultTableCellRenderer() {
-        override fun getTableCellRendererComponent(
-            table: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, column: Int,
-        ): Component {
-            super.getTableCellRendererComponent(table, "", isSelected, hasFocus, row, column)
-            icon = AllIcons.General.Error
-            horizontalAlignment = CENTER
-            return this
-        }
-    }
-
-    init {
-        // Show each problem's detail as a tooltip on hover.
-        table.setDefaultRenderer(Any::class.java, object : DefaultTableCellRenderer() {
-            override fun getTableCellRendererComponent(
-                t: JTable, value: Any?, isSelected: Boolean, hasFocus: Boolean, row: Int, column: Int,
-            ): Component {
-                val c = super.getTableCellRendererComponent(t, value, isSelected, hasFocus, row, column)
-                toolTipText = model.problemAt(row)?.detail ?: model.problemAt(row)?.message
-                return c
-            }
-        })
+    private companion object {
+        const val CARD_COMPILE = "compile"
+        const val CARD_MESSAGE = "message"
     }
 }

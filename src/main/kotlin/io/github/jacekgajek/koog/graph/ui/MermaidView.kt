@@ -41,6 +41,9 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
     /** Invoked (on the EDT) with the from/to node ids when the user clicks an edge. */
     var onEdgeClick: (from: String, to: String) -> Unit = { _, _ -> }
 
+    /** Invoked (on the EDT) when the user clicks the "refresh" link in the compile-error notice. */
+    var onRefresh: () -> Unit = {}
+
     private val jsQuery: JBCefJSQuery? = browser?.let { JBCefJSQuery.create(it as JBCefBrowserBase) }
 
     private val fallback = JTextArea().apply {
@@ -101,6 +104,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                     ApplicationManager.getApplication().invokeLater { onEdgeClick(from, to) }
                 }
             }
+            "refresh" -> ApplicationManager.getApplication().invokeLater { onRefresh() }
         }
     }
 
@@ -115,6 +119,20 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
             return
         }
         runJs("koogMessage('${b64(title)}', '${b64(detail)}')")
+    }
+
+    /**
+     * Show the "There are compile errors. Rebuild your project and refresh." notice with a
+     * clickable "refresh" link (wired to [onRefresh]). Shown instead of the raw kotlinc
+     * diagnostics — whose temp-dir paths read like a plugin bug — so it's clear the project
+     * just needs rebuilding. Falls back to plain text when JCEF is unavailable.
+     */
+    fun showCompileError() {
+        if (browser == null) {
+            fallback.text = "There are compile errors.\n\nRebuild your project and refresh."
+            return
+        }
+        runJs("koogCompileError()")
     }
 
     /**
@@ -306,6 +324,7 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 .msg h3 { margin: 0 0 8px; font-weight: 600; }
                 .msg .detail { white-space: pre-wrap; color: $fg; opacity: 0.8;
                   font-family: monospace; font-size: 12px; }
+                .msg a { color: #4c9aff; cursor: pointer; text-decoration: underline; }
                 .error { white-space: pre-wrap; color: #c0392b; font-family: monospace;
                   font-size: 12px; }
                 /* Caret-driven highlight of the node/edge under the editor cursor. */
@@ -370,6 +389,20 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                   if (d) h += '<pre class="detail">' + __esc(d) + '</pre>';
                   h += '</div>';
                   document.getElementById('root').innerHTML = h;
+                }
+                // The compile-error notice: a clear "rebuild & refresh" hint with a clickable
+                // refresh link, never the raw kotlinc diagnostics (whose temp paths look like a
+                // plugin bug). The link rings back to the IDE via __koogSend (defined above when
+                // a JCEF query is wired — always the case once this page is loaded).
+                function koogCompileError() {
+                  var h = '<div class="msg"><h3>There are compile errors</h3>' +
+                          '<p>Rebuild your project and <a href="#" id="koog-refresh">refresh</a>.</p></div>';
+                  document.getElementById('root').innerHTML = h;
+                  var a = document.getElementById('koog-refresh');
+                  if (a) a.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    if (typeof __koogSend === 'function') __koogSend('refresh');
+                  });
                 }
 
                 // Caret-driven highlight. The desired target is remembered in __koogWant
