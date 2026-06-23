@@ -86,13 +86,21 @@ object MermaidExporter {
      * otherwise [problems] explains why (graph validation error, compile error, …)
      * and the caller keeps the previously shown diagram. [cacheable] is false for
      * transient/infrastructure outcomes (timeouts, missing compiler) that shouldn't
-     * be memoized.
+     * be memoized. [compileError] flags the specific case where the strategy snippet
+     * didn't compile *because of another file* (a stale/unbuilt dependency, not the
+     * strategy itself): the caller surfaces a "rebuild & refresh" hint rather than the
+     * raw kotlinc diagnostics, whose temp-dir paths look like a plugin bug. [inFileCompileError]
+     * flags the other compile case — the errors are in the strategy's own file. The user sees
+     * those in their editor, so the caller keeps the current diagram untouched if there is one;
+     * with no diagram to keep it shows a brief notice rather than leaving a stuck spinner.
      */
     class ExportOutcome(
         val name: String,
         val mermaid: String?,
         val problems: List<Problem>,
         val cacheable: Boolean = true,
+        val compileError: Boolean = false,
+        val inFileCompileError: Boolean = false,
     )
 
     /** Build the runner + collect the module classpath. Call inside a read action. */
@@ -300,7 +308,18 @@ object MermaidExporter {
             // Don't cache: compile errors can depend on external state (an unbuilt
             // module, a stale classpath) that a rebuild fixes without the strategy
             // text changing — caching would pin the stale error.
-            return ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false)
+            return if (compileErrorIsExternal(compile.diagnostics)) {
+                // The failure is in another file (a stale/unbuilt dependency the user
+                // can't see is the culprit). Surface a "rebuild & refresh" hint instead of
+                // the raw diagnostics (whose temp-dir paths read like a plugin bug).
+                ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false, compileError = true)
+            } else {
+                // The only errors are in the strategy's own file — the user already sees them
+                // in their editor as they type. The UI keeps the current diagram if there is
+                // one (no nagging), or shows a brief notice if there's nothing to keep.
+                LOG.info("run: compile errors are confined to the strategy's own file")
+                ExportOutcome(prepared.name, null, emptyList(), cacheable = false, inFileCompileError = true)
+            }
         }
 
         val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars + mockk)
@@ -389,6 +408,27 @@ object MermaidExporter {
         File(workDir, "compile-cmd.txt").writeText(cmd.commandLineString)
         val out = exec(cmd, COMPILE_TIMEOUT_MS) ?: return null
         return CompilerDaemon.CompileResult(out.exitCode, out.stderr.ifBlank { out.stdout })
+    }
+
+    /**
+     * Whether the failed compile reports an error in a file *other than* the strategy's own.
+     * The snippet is a verbatim copy of the strategy's file ([StrategySnippet.FILE_NAME]);
+     * referenced sibling files are pulled in as `extra*` sources. An error outside the
+     * snippet means a rebuild is needed for a reason the user can't see in the file they're
+     * editing, so it's worth surfacing; an error confined to the snippet is already visible
+     * to them as they type. Errors with no attributable file (rare) don't count as external.
+     */
+    private fun compileErrorIsExternal(diagnostics: String): Boolean =
+        diagnostics.lineSequence()
+            .filter { it.contains(": error:") }
+            .mapNotNull { errorFileName(it) }
+            .any { it != StrategySnippet.FILE_NAME }
+
+    /** The source-file basename in a kotlinc diagnostic line ("/path/Foo.kt:1:2: error: …" → "Foo.kt"). */
+    private fun errorFileName(line: String): String? {
+        val end = line.indexOf(".kt:")
+        if (end < 0) return null
+        return line.substring(0, end + 3).substringAfterLast('/').substringAfterLast('\\')
     }
 
     /** kotlinc diagnostics → one Problem per error/warning line. */

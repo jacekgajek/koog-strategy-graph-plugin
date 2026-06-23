@@ -172,6 +172,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         val tab = GraphTab(pointer, view, content)
         view.onNodeClick = tab::navigateToNode
         view.onEdgeClick = tab::navigateToEdge
+        view.onRefresh = { refresh() }
         view.onDetach = { detachTab(pointer, file, content) }
         tab.listenTo(file)
         tabs += tab
@@ -194,6 +195,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         val tab = GraphTab(pointer, view, null)
         view.onNodeClick = tab::navigateToNode
         view.onEdgeClick = tab::navigateToEdge
+        view.onRefresh = { refresh() }
         detached += tab
 
         val frame = FrameWrapper(project, "koog.graph.detached.window")
@@ -266,6 +268,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         val preview = GraphTab(null, previewPanel, null)
         previewPanel.onNodeClick = preview::navigateToNode
         previewPanel.onEdgeClick = preview::navigateToEdge
+        previewPanel.onRefresh = { refresh() }
         previewPanel.showMessage("No strategy selected", "Pick a strategy from the list above to preview its graph.")
         previewTab = preview
 
@@ -525,21 +528,40 @@ class KoogGraphService(private val project: Project) : Disposable {
             }
         }
 
-        /** Apply an outcome to the view: update the diagram if present, always set problems. */
+        /**
+         * Apply an outcome to the view. A produced diagram takes the canvas. An error keeps the
+         * last good diagram on screen when there is one — shown in the bottom strip so live edits
+         * don't flip the canvas between graph and error — and only takes over the canvas when
+         * there's no diagram to keep. A compile error in *another* file surfaces a "rebuild &
+         * refresh" hint (never the raw kotlinc diagnostics, whose temp paths look like a plugin
+         * bug); one confined to the strategy's own file is left alone (the user sees it in their
+         * editor already). A graph/logical error (e.g. a dead end) surfaces its single message.
+         */
         private fun apply(outcome: MermaidExporter.ExportOutcome, key: String) {
-            if (outcome.mermaid != null) {
-                view.showDiagram(outcome.mermaid)
-                content?.displayName = outcome.name
-                onName?.invoke(outcome.name)
-                hasDiagram = true
-                lastKey = key
-                view.setProblems(emptyList())
-            } else {
-                if (!hasDiagram) {
-                    val first = outcome.problems.firstOrNull()
-                    view.showMessage(first?.message ?: "No diagram", first?.detail ?: "")
+            when {
+                outcome.mermaid != null -> {
+                    view.showDiagram(outcome.mermaid)
+                    content?.displayName = outcome.name
+                    onName?.invoke(outcome.name)
+                    hasDiagram = true
+                    lastKey = key
                 }
-                view.setProblems(outcome.problems)
+                // A compile error in the strategy's own file: the user sees it in their editor.
+                // Keep a good diagram untouched (no nagging); with none to keep, show a brief
+                // notice rather than leaving the "Generating…" spinner stuck.
+                outcome.inFileCompileError -> {
+                    if (!hasDiagram) {
+                        view.showMessage("Cannot generate the diagram", "This file has compile errors — fix them and the diagram will update.")
+                    }
+                }
+                outcome.compileError -> {
+                    if (hasDiagram) view.showCompileErrorBanner() else view.showCompileError()
+                }
+                else -> {
+                    val first = outcome.problems.firstOrNull()
+                    if (hasDiagram) view.showErrorBanner(first?.message ?: "Diagram error")
+                    else view.showMessage(first?.message ?: "No diagram", first?.detail ?: "")
+                }
             }
         }
 

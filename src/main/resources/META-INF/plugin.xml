@@ -17,6 +17,24 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.7</h3>
+        <ul>
+            <li>Compile failures are no longer shown as raw <code>kotlinc</code> diagnostics
+                (whose temporary-directory paths looked like a plugin error). When the strategy
+                can't compile because of <em>another</em> file — typically a stale or unbuilt
+                dependency — the graph now shows a clear <em>"There are compile errors. Rebuild
+                your project and refresh."</em> notice, where <em>refresh</em> is a link that
+                re-generates the graph just like the toolbar button.</li>
+            <li>Compile errors in the strategy's <em>own</em> file are no longer surfaced
+                separately — you already see them in the editor. A previously rendered diagram
+                stays on screen while you fix them; if there is no diagram yet, a brief
+                "fix the compile errors" notice is shown instead of a stuck spinner.</li>
+            <li>Errors no longer blank the canvas: while a valid diagram is on screen, a compile
+                or graph error appears in an unobtrusive strip along the bottom, so live edits
+                don't flip the view back and forth between the graph and an error message.</li>
+            <li>Graph (strategy) errors and compile errors are now clearly distinguished, and the
+                old "Graph problems" list was removed in favour of the single relevant message.</li>
+        </ul>
         <h3>0.1.6</h3>
         <ul>
             <li>Node factories defined in a <em>separate file</em> (e.g. a helper
