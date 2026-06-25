@@ -461,7 +461,7 @@ class KoogGraphService(private val project: Project) : Disposable {
                 // the same file (their file text is identical) so they don't collide in the
                 // shared cache. Both parts are canonicalized, so whitespace/comment-only
                 // edits still short-circuit.
-                canonicalKey(call) + " " + canonicalKey(call.containingFile)
+                canonicalKey(call) + " " + canonicalKey(call.containingFile)
             }
             if (key == null) {
                 LOG.info("render #$gen: strategy gone / invalid — keeping current view")
@@ -580,6 +580,8 @@ class KoogGraphService(private val project: Project) : Disposable {
                 val vf = prop.containingFile.virtualFile ?: return@Callable null
                 vf to prop.textOffset
             })
+                // resolveNodeProperty resolves references, which needs indexes — wait for them.
+                .inSmartMode(project)
                 .expireWith(view)
                 .finishOnUiThread(ModalityState.defaultModalityState()) { target ->
                     if (target == null) LOG.info("navigateToNode: no declaration for node '$id' in the strategy")
@@ -606,6 +608,8 @@ class KoogGraphService(private val project: Project) : Disposable {
                 val vf = binary.containingFile?.virtualFile ?: return@Callable null
                 vf to binary.textOffset
             })
+                // resolveVarName resolves references, which needs indexes — wait for them.
+                .inSmartMode(project)
                 .expireWith(view)
                 .finishOnUiThread(ModalityState.defaultModalityState()) { target ->
                     if (target == null) LOG.info("navigateToEdge: no 'edge($from forwardTo $to)' found in the strategy")
@@ -717,6 +721,8 @@ class KoogGraphService(private val project: Project) : Disposable {
                 if (!call.isValid || !call.textRange.contains(offset)) Highlight(null, null, null)
                 else highlightFor(call, offset)
             })
+                // highlightFor → nodeDisplayName resolves references, which needs indexes.
+                .inSmartMode(project)
                 .expireWith(view)
                 .coalesceBy(this, vf)
                 .finishOnUiThread(ModalityState.any(), ::applyHighlight)
