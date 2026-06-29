@@ -5,6 +5,7 @@ import com.intellij.execution.process.CapturingProcessHandler
 import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.diagnostic.logger
 import com.intellij.openapi.module.Module
+import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.openapi.projectRoots.JavaSdk
 import com.intellij.openapi.roots.CompilerModuleExtension
@@ -115,14 +116,23 @@ object MermaidExporter {
             LOG.warn("prepare: no module found for strategy '${snippet.name}'; cannot resolve classpath")
             return null
         }
-        val orderClasspath = OrderEnumerator.orderEntries(module)
+        // In a Kotlin Multiplatform project the strategy usually lives in a *common* source set
+        // (e.g. `…commonMain`), whose IDE module carries only Kotlin metadata klibs and no JVM
+        // classpath — kotlinc can't resolve `ai.koog.*` from those, so the snippet fails to compile
+        // with everything unresolved. The compilable JVM view (real dependency jars + the
+        // `build/classes/kotlin/jvm/main` output, which also holds the compiled common sources)
+        // lives on the JVM source-set module. Resolve classpath/outputs/SDK/target against that
+        // counterpart when there is one; keep `module` (the PSI's own) for scoping same-module
+        // source collection, since the referenced helpers sit in the common source set.
+        val cpModule = jvmCounterpart(module) ?: module
+        val orderClasspath = OrderEnumerator.orderEntries(cpModule)
             .recursively()
             .withoutSdk()
             .classes()
             .pathsList
             .pathList
 
-        val moduleSdkHome = ModuleRootManager.getInstance(module).sdk?.homePath
+        val moduleSdkHome = ModuleRootManager.getInstance(cpModule).sdk?.homePath
         val javaHome = moduleSdkHome ?: System.getProperty("java.home")
         val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
 
@@ -132,9 +142,9 @@ object MermaidExporter {
         // gives us these for JPS builds — but for Gradle-delegated builds it's often
         // empty (the editor resolves siblings from source, not output). So we also
         // derive the on-disk Gradle/IDEA output dirs and use whatever actually exists.
-        val ext = CompilerModuleExtension.getInstance(module)
+        val ext = CompilerModuleExtension.getInstance(cpModule)
         val outputs = (listOfNotNull(ext?.compilerOutputPath?.path, ext?.compilerOutputPathForTests?.path) +
-            deriveModuleOutputs(module)).distinct()
+            deriveModuleOutputs(cpModule)).distinct()
 
         val classpath = (orderClasspath + outputs).distinct()
         val friendPaths = outputs
@@ -149,10 +159,11 @@ object MermaidExporter {
             val f = strategyFile ?: return@provider emptyList()
             runReadAction { if (f.isValid) collectReferencedSources(f, module) else emptyList() }
         }
-        val jvmTarget = jvmTargetFor(module)
+        val jvmTarget = jvmTargetFor(cpModule)
 
         LOG.info(
-            "prepare: strategy='${snippet.name}', module='${module.name}', " +
+            "prepare: strategy='${snippet.name}', module='${module.name}'" +
+                (if (cpModule !== module) " (classpath via '${cpModule.name}')" else "") + ", " +
                 "classpath=${classpath.size} entries (orderEntries=${orderClasspath.size}, outputs=${outputs.size}), " +
                 "sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
                 "javaExe=$javaExe, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
@@ -220,6 +231,28 @@ object MermaidExporter {
     }
 
     /**
+     * For a Kotlin Multiplatform *common* source-set module (e.g. `…commonMain`), the matching
+     * JVM source-set module (`…jvmMain`). Gradle's KMP import names source-set modules
+     * `<base>.<sourceSet>`, and a common source set's module carries only Kotlin metadata klibs —
+     * no JVM classpath — whereas its JVM counterpart has the real dependency jars and compiled
+     * output. Returns null when [module] is already a concrete (non-common) source set or no JVM
+     * counterpart module exists, in which case the caller falls back to [module] itself.
+     */
+    private fun jvmCounterpart(module: Module): Module? {
+        val base = module.name.substringBeforeLast('.', "")
+        if (base.isEmpty()) return null
+        val candidates = when (val sourceSet = module.name.substringAfterLast('.')) {
+            "commonMain" -> listOf("jvmMain", "main")
+            "commonTest" -> listOf("jvmTest", "test")
+            // Other intermediate common source sets (e.g. `nonJvmCommonMain` won't apply, but
+            // `commonMainFoo`-style names map by swapping the `common` prefix for `jvm`).
+            else -> if (sourceSet.startsWith("common")) listOf("jvm" + sourceSet.removePrefix("common")) else return null
+        }
+        val mm = ModuleManager.getInstance(module.project)
+        return candidates.firstNotNullOfOrNull { mm.findModuleByName("$base.$it") }
+    }
+
+    /**
      * Best-effort discovery of a module's on-disk compiled output directories for
      * Gradle/IDEA layouts, used when IntelliJ's compiler-output model is empty
      * (typical for Gradle-delegated builds). Returns only directories that exist.
@@ -230,6 +263,9 @@ object MermaidExporter {
         val subPaths = listOf(
             "build/classes/kotlin/main", "build/classes/java/main",
             "build/classes/kotlin/test", "build/classes/java/test",
+            // Kotlin Multiplatform JVM target output: the compiled common + jvm sources
+            // land here, not under the plain `kotlin/main` path used for JVM-only modules.
+            "build/classes/kotlin/jvm/main", "build/classes/kotlin/jvm/test",
             "build/resources/main",
             "out/production/classes", "out/test/classes",
         )
@@ -401,6 +437,12 @@ object MermaidExporter {
             addParameters("-d", outDir.absolutePath)
             addParameters("-jvm-target", jvmTarget)
             if (friendPaths.isNotEmpty()) addParameter("-Xfriend-paths=${friendPaths.joinToString(",")}")
+            // See CompilerWorkerMain: lets a copied KMP common/commonTest source compile as JVM
+            // (allows @OptionalExpectation annotations like @JsName); a no-op for plain JVM sources.
+            addParameter("-Xmulti-platform")
+            addParameter("-Xcommon-sources=${srcFiles.joinToString(",") { it.absolutePath }}")
+            // Enable kotlinx-serialization for copied `@Serializable` types (see CompilerWorkerMain).
+            CompilerWorkerMain.serializationPlugin(compileClasspath)?.let { addParameter("-Xplugin=$it") }
             addParameters("-no-stdlib", "-no-reflect")
             srcFiles.forEach { addParameter(it.absolutePath) }
             charset = StandardCharsets.UTF_8

@@ -17,6 +17,19 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.9</h3>
+        <ul>
+            <li>The diagram no longer leaves behind a stray, half-rendered graph when a render
+                fails: orphaned SVG elements are cleaned up so the next render starts from a
+                clean slate.</li>
+            <li>More robust graph generation for the different kinds of strategy declarations,
+                including strategies produced by generic factory functions, which now resolve
+                and render more reliably.</li>
+        </ul>
+        <h3>0.1.8</h3>
+        <ul>
+            <li>Fix occasional IndexNotReadyException error on startup</li>
+        </ul>
         <h3>0.1.7</h3>
         <ul>
             <li>Compile failures are no longer shown as raw <code>kotlinc</code> diagnostics

@@ -362,20 +362,36 @@ class MermaidView : JPanel(BorderLayout()), Disposable {
                 mermaid.initialize({ startOnLoad: false, theme: '$theme', securityLevel: 'loose' });
 
                 var __seq = 0;
+                // On a parse error mermaid leaves the "bomb" SVG it built behind in <body>
+                // (a temp element id'd after the render id, which we vary per call). Left
+                // alone these stack up — every failed retry adds another below the diagram.
+                // Remove any such orphan (anything id'd 'koogsvg…'/'dkoogsvg…' that isn't the
+                // SVG we mounted in #root) before and after each render.
+                function koogCleanupOrphans() {
+                  var root = document.getElementById('root');
+                  document.querySelectorAll('[id^="koogsvg"], [id^="dkoogsvg"]').forEach(function (el) {
+                    if (!root || !root.contains(el)) {
+                      try { el.remove(); } catch (e) {}
+                    }
+                  });
+                }
                 // Render off-DOM, then swap the whole #root in one shot: the old diagram
                 // stays visible until the new SVG is ready (effective double-buffering).
                 function koogRender(b64) {
                   var text = __b64(b64);
                   window.__koogSrc = text;
+                  koogCleanupOrphans();
                   mermaid.render('koogsvg' + (++__seq), text).then(function (res) {
                     var root = document.getElementById('root');
                     root.innerHTML = res.svg;
                     if (res.bindFunctions) res.bindFunctions(root);
                     koogBindClicks();
                     koogApplyHighlight();
+                    koogCleanupOrphans();
                   }).catch(function (e) {
                     document.getElementById('root').innerHTML =
                       '<pre class="error">' + __esc(String(e && e.message ? e.message : e)) + '</pre>';
+                    koogCleanupOrphans();
                   });
                 }
                 // Show/hide the static refresh hourglass in the corner.

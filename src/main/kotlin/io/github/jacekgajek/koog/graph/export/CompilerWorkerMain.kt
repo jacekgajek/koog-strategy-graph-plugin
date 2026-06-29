@@ -38,6 +38,15 @@ object CompilerWorkerMain {
         }
     }
 
+    /**
+     * The kotlinx-serialization compiler-plugin jar among [classpath] entries, or null. Prefers
+     * the modern `kotlinx-serialization-compiler-plugin` over the legacy `kotlin-serialization-…`.
+     */
+    internal fun serializationPlugin(classpath: List<String>): String? {
+        fun named(prefix: String) = classpath.firstOrNull { File(it).name.startsWith(prefix) }
+        return named("kotlinx-serialization-compiler-plugin") ?: named("kotlin-serialization-compiler-plugin")
+    }
+
     private fun compile(requestFile: File): Int {
         val lines = requestFile.readLines()
         val outDir = lines[0]
@@ -45,7 +54,8 @@ object CompilerWorkerMain {
         val friendPaths = lines[2]
         val diagFile = lines[3]
         val n = lines[4].toInt()
-        val classpath = lines.subList(5, 5 + n).joinToString(File.pathSeparator)
+        val cpEntries = lines.subList(5, 5 + n)
+        val classpath = cpEntries.joinToString(File.pathSeparator)
         val s = lines[5 + n].toInt()
         val srcFiles = lines.subList(6 + n, 6 + n + s)
 
@@ -54,6 +64,20 @@ object CompilerWorkerMain {
             add("-d"); add(outDir)
             add("-jvm-target"); add(jvmTarget)
             if (friendPaths.isNotBlank()) add("-Xfriend-paths=$friendPaths")
+            // Koog test files routinely declare `@Serializable` types (e.g. a structured-output
+            // model used as a `nodeLLMRequestStructured<T>` type argument). Those need the
+            // kotlinx-serialization compiler plugin to generate `T.serializer()`; it's on the
+            // classpath but not active unless registered, so enable it when present.
+            serializationPlugin(cpEntries)?.let { add("-Xplugin=$it") }
+            // The snippet is a verbatim copy of the strategy's file. In a Kotlin Multiplatform
+            // project that file is a common/commonTest source and may use constructs only legal
+            // there — `@OptionalExpectation` annotations like `@JsName`, `expect`/`actual`. We
+            // compile it as a single JVM module: `-Xmulti-platform` enables multiplatform mode and
+            // `-Xcommon-sources` marks our files as common (which is what actually permits the
+            // `@OptionalExpectation` usages — `-Xmulti-platform` alone does not). Both are no-ops
+            // for plain JVM sources: they still compile straight to JVM bytecode.
+            add("-Xmulti-platform")
+            add("-Xcommon-sources=${srcFiles.joinToString(",")}")
             add("-no-stdlib"); add("-no-reflect")
             addAll(srcFiles)
         }.toTypedArray()

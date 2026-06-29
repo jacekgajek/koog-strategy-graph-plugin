@@ -26,7 +26,7 @@ class StrategyLineMarkerProvider : LineMarkerProviderDescriptor() {
         val nameRef = element.parent as? KtNameReferenceExpression ?: return null
         val call = nameRef.parent as? KtCallExpression ?: return null
         if (call.calleeExpression !== nameRef) return null
-        if (!StrategyParser().looksLikeStrategyCall(call)) return null
+        if (!StrategyParser().isRenderableStrategyCall(call)) return null
 
         return LineMarkerInfo(
             element,
