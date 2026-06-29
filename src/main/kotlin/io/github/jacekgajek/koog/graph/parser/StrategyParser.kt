@@ -1,12 +1,15 @@
 package io.github.jacekgajek.koog.graph.parser
 
+import com.intellij.psi.PsiElement
 import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtLambdaExpression
 import org.jetbrains.kotlin.psi.KtNameReferenceExpression
+import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtStringTemplateExpression
+import org.jetbrains.kotlin.psi.KtValueArgument
 
 class StrategyParser {
 
@@ -14,6 +17,23 @@ class StrategyParser {
         val callee = call.calleeExpression as? KtNameReferenceExpression ?: return false
         if (callee.getReferencedName() != "strategy") return false
         return call.lambdaArguments.isNotEmpty()
+    }
+
+    /**
+     * Whether [call] is a strategy we surface for rendering (gutter marker + overview entry).
+     * That's a `strategy { }` call we can lift into a standalone runner: bound to a declaration
+     * or inlined in a function body. It excludes a strategy passed **directly as a call argument**
+     * (e.g. `createAgent(strategy = strategy(...) { })`) — an anonymous inline strategy with no
+     * declaration to reference, which we deliberately don't support.
+     */
+    fun isRenderableStrategyCall(call: KtCallExpression): Boolean =
+        looksLikeStrategyCall(call) && !isInlineArgument(call)
+
+    private fun isInlineArgument(call: KtCallExpression): Boolean {
+        var node: PsiElement = call
+        var parent = node.parent
+        while (parent is KtParenthesizedExpression) { node = parent; parent = parent.parent }
+        return parent is KtValueArgument
     }
 
     /**

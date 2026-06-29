@@ -600,13 +600,18 @@ class KoogGraphService(private val project: Project) : Disposable {
                 val call = pointer?.element ?: return@Callable null
                 val fromVar = resolveVarName(call, from)
                 val toVar = resolveVarName(call, to)
-                val binary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
-                    .firstOrNull {
-                        it.operationReference.getReferencedName() == "forwardTo" &&
-                            leadingName(it.left) == fromVar && leadingName(it.right) == toVar
-                    } ?: return@Callable null
-                val vf = binary.containingFile?.virtualFile ?: return@Callable null
-                vf to binary.textOffset
+                val binaries = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
+                // An `edge(from forwardTo to …)`, or a `then` chain link `… from then to …`.
+                val forwardTo = binaries.firstOrNull {
+                    it.operationReference.getReferencedName() == "forwardTo" &&
+                        leadingName(it.left) == fromVar && leadingName(it.right) == toVar
+                }
+                val target = forwardTo ?: binaries.firstOrNull {
+                    it.operationReference.getReferencedName() == "then" &&
+                        thenEndpoints(it).let { (f, t) -> f == fromVar && t == toVar }
+                }?.right ?: return@Callable null
+                val vf = target.containingFile?.virtualFile ?: return@Callable null
+                vf to target.textOffset
             })
                 // resolveVarName resolves references, which needs indexes — wait for them.
                 .inSmartMode(project)
@@ -694,6 +699,19 @@ class KoogGraphService(private val project: Project) : Disposable {
             else -> PsiTreeUtil.findChildOfType(expr, KtNameReferenceExpression::class.java)?.getReferencedName()
         }
 
+        /**
+         * The (from, to) node names of a single `then` link. `a then b then c` parses
+         * left-associatively as `((a then b) then c)`, and each `then` adds the edge
+         * `<last node of the left> → <right>` — so for `L then R` the source is `R`'s
+         * predecessor: the right operand of `L` when `L` is itself a `then`, else `L`.
+         */
+        private fun thenEndpoints(binary: KtBinaryExpression): Pair<String?, String?> {
+            val left = binary.left
+            val from = if (left is KtBinaryExpression && left.operationReference.getReferencedName() == "then")
+                leadingName(left.right) else leadingName(left)
+            return from to leadingName(binary.right)
+        }
+
         fun listenTo(file: VirtualFile?) {
             currentFile = file
             // getDocument walks the file model and needs a read action; we're on the EDT.
@@ -751,14 +769,23 @@ class KoogGraphService(private val project: Project) : Disposable {
                         it.textRange.contains(offset)
                 }
                 .minByOrNull { it.textRange.length }
+            // A `then` chain link under the caret (`a then b then c`) — the innermost wins.
+            val thenBinary = PsiTreeUtil.findChildrenOfType(call, KtBinaryExpression::class.java)
+                .filter { it.operationReference.getReferencedName() == "then" && it.textRange.contains(offset) }
+                .minByOrNull { it.textRange.length }
 
-            val edgeIsMoreSpecific = edgeCall != null &&
-                (prop == null || edgeCall.textRange.length < prop.textRange.length)
-            if (edgeIsMoreSpecific) {
-                val binary = PsiTreeUtil.findChildrenOfType(edgeCall, KtBinaryExpression::class.java)
-                    .firstOrNull { it.operationReference.getReferencedName() == "forwardTo" }
-                val from = leadingName(binary?.left)
-                val to = leadingName(binary?.right)
+            // The most specific edge candidate (smallest range) — an `edge(…)` call or a `then` link.
+            val edgeEndpoints: Pair<Int, Pair<String?, String?>>? = listOfNotNull(
+                edgeCall?.let { ec ->
+                    val b = PsiTreeUtil.findChildrenOfType(ec, KtBinaryExpression::class.java)
+                        .firstOrNull { it.operationReference.getReferencedName() == "forwardTo" }
+                    ec.textRange.length to (leadingName(b?.left) to leadingName(b?.right))
+                },
+                thenBinary?.let { it.textRange.length to thenEndpoints(it) },
+            ).minByOrNull { it.first }
+
+            if (edgeEndpoints != null && (prop == null || edgeEndpoints.first < prop.textRange.length)) {
+                val (from, to) = edgeEndpoints.second
                 if (from != null && to != null) {
                     return Highlight(node = null, from = mermaidIdForVar(call, from), to = mermaidIdForVar(call, to))
                 }

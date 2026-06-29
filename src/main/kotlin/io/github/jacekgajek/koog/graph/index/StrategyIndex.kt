@@ -50,7 +50,7 @@ object StrategyIndex {
             val vf = ktFile.virtualFile ?: return@processAllFilesWithWord true
             val doc = pdm.getDocument(ktFile)
             PsiTreeUtil.collectElementsOfType(ktFile, KtCallExpression::class.java).forEach { call ->
-                if (!parser.looksLikeStrategyCall(call)) return@forEach
+                if (!parser.isRenderableStrategyCall(call)) return@forEach
                 val name = parser.strategyName(call)?.takeIf { it.isNotBlank() } ?: "<unnamed>"
                 val line = doc?.let { it.getLineNumber(call.textOffset) + 1 } ?: 0
                 val rel = relativePath(base, vf)
