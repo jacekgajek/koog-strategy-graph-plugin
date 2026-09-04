@@ -8,6 +8,7 @@ import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClass
 import org.jetbrains.kotlin.psi.KtClassBody
 import org.jetbrains.kotlin.psi.KtClassOrObject
+import org.jetbrains.kotlin.psi.KtContextReceiverList
 import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtModifierListOwner
@@ -65,6 +66,8 @@ data class StrategySnippet(
 
         /** Name of the synthetic member we inject to obtain the strategy from inside a class. */
         private const val EXPORT_FN = "__koogExportStrategy"
+        /** Name of the synthetic top-level function we inject when a top-level/inline strategy's enclosing function has `context(...)` parameters (see [contextBridgeBody]). */
+        private const val TOP_LEVEL_EXPORT_FN = "__koogExportStrategyTopLevel"
         private const val STRATEGY_TYPE = "ai.koog.agents.core.agent.entity.AIAgentGraphStrategy<*, *>"
 
         /** The (possibly rewritten) file text plus the `main()` expression that yields the strategy. */
@@ -154,9 +157,10 @@ data class StrategySnippet(
         private fun planExport(call: KtCallExpression, file: KtFile): Plan {
             val owner = valueOwnerOf(call)
 
-            // 1) Top-level declaration — reference it directly, no rewrite needed.
+            // 1) Top-level declaration — reference it directly, no rewrite needed (unless it
+            // needs a context bridge, see topLevelPlan).
             if (owner != null && owner.parent is KtFile) {
-                topLevelRef(owner)?.let { return Plan(file.text, it, "top-level-ref") }
+                topLevelPlan(owner, file)?.let { return it }
             }
 
             // 2) Inside a reachable class/object — inject a member and call it.
@@ -169,16 +173,27 @@ data class StrategySnippet(
             }
 
             // 3) Inline at top level, reproducing referenced locals.
-            return Plan(file.text, inlineWithLocals(call), "inline")
+            return inlinePlan(call, file)
         }
 
-        /** A reference to a top-level declaration whose value is the strategy, or null if not simply callable. */
-        private fun topLevelRef(owner: KtDeclaration): String? = when (owner) {
-            is KtNamedFunction -> owner.name?.takeIf { owner.receiverTypeReference == null }
-                ?.let { factoryCall(escapeName(it), owner) }
-            is KtProperty -> owner.name?.let(::escapeName)
+        /** A top-level declaration whose value is the strategy: reference it, bridging `context(...)` parameters (see [contextBridgeBody]) if it has any. */
+        private fun topLevelPlan(owner: KtDeclaration, file: KtFile): Plan? = when (owner) {
+            is KtNamedFunction -> owner.name?.takeIf { owner.receiverTypeReference == null }?.let { name ->
+                val types = contextParamTypes(owner)
+                val call = factoryCall(escapeName(name), owner)
+                if (types.isEmpty()) {
+                    Plan(file.text, call, "top-level-ref")
+                } else {
+                    Plan(appendTopLevelExportFn(file.text, types, call), "`$TOP_LEVEL_EXPORT_FN`()", "top-level-ref-ctx")
+                }
+            }
+            is KtProperty -> owner.name?.let { Plan(file.text, escapeName(it), "top-level-ref") }
             else -> null
         }
+
+        /** [file.text] plus a synthetic top-level function bridging [types] as implicit receivers around [call] (see [contextBridgeBody]). */
+        private fun appendTopLevelExportFn(fileText: String, types: List<String>, call: String): String =
+            "$fileText\n\nfun `$TOP_LEVEL_EXPORT_FN`(): $STRATEGY_TYPE {\n${contextBridgeBody(types, call)}\n}\n"
 
         /**
          * A call to factory function [escapedName]/[fn] with synthesized arguments. When the
@@ -202,7 +217,7 @@ data class StrategySnippet(
             if (isMemberOfCls) {
                 when (owner) {
                     is KtNamedFunction -> owner.name?.takeIf { owner.receiverTypeReference == null }
-                        ?.let { return "return ${factoryCall(escapeName(it), owner)}" }
+                        ?.let { return contextBridgeBody(contextParamTypes(owner), factoryCall(escapeName(it), owner)) }
                     is KtProperty -> owner.name?.let { return "return ${escapeName(it)}" }
                     else -> {}
                 }
@@ -216,6 +231,53 @@ data class StrategySnippet(
             val prelude = capturedPrelude(call)
             if (prelude.isEmpty()) return call.text
             return "run {\n        ${prelude}${call.text}\n    }"
+        }
+
+        /**
+         * The strategy expression at the top level (see [inlineWithLocals]), bridging its
+         * enclosing function's `context(...)` parameters (see [contextBridgeBody]) if it has any.
+         */
+        private fun inlinePlan(call: KtCallExpression, file: KtFile): Plan {
+            val inlineExpr = inlineWithLocals(call)
+            val types = PsiTreeUtil.getParentOfType(call, KtNamedFunction::class.java)?.let(::contextParamTypes).orEmpty()
+            return if (types.isEmpty()) {
+                Plan(file.text, inlineExpr, "inline")
+            } else {
+                Plan(appendTopLevelExportFn(file.text, types, inlineExpr), "`$TOP_LEVEL_EXPORT_FN`()", "inline-ctx")
+            }
+        }
+
+        /**
+         * The types of [owner]'s `context(...)` parameters/receivers (both the named
+         * `context(name: Type)` and the older unnamed `context(Type)` syntax), de-duplicated.
+         * Empty when [owner] declares none.
+         */
+        private fun contextParamTypes(owner: KtNamedFunction): List<String> {
+            // The context list sits inside the function's modifier list (`fun`'s own children
+            // are the modifier list, value-parameter list, return type, body — not the context
+            // list itself), so look one level down rather than at owner's direct children.
+            val list = owner.modifierList?.let { PsiTreeUtil.getChildOfType(it, KtContextReceiverList::class.java) }
+                ?: return emptyList()
+            return (list.contextParameters.mapNotNull { it.typeReference?.text } +
+                list.contextReceivers().mapNotNull { it.typeReference()?.text }).distinct()
+        }
+
+        /**
+         * A function body (statements, ending in `return`) that evaluates [finalExpr] with a
+         * relaxed mock of each of [types] available as an implicit receiver — which is how a
+         * `context(name: Type)` parameter [finalExpr] needs resolves, since Kotlin's context-
+         * parameter lookup also matches ordinary (dispatch/extension) receivers in scope. Each
+         * type gets its own nested local extension function so multiple context parameters each
+         * get a receiver of their own type (Kotlin has only one extension receiver per function).
+         * Returns plain `"return $finalExpr"` when [types] is empty.
+         */
+        private fun contextBridgeBody(types: List<String>, finalExpr: String): String {
+            var body = "return $finalExpr"
+            types.asReversed().forEachIndexed { i, type ->
+                val fn = "__koogCtx${types.size - 1 - i}"
+                body = "fun $type.`$fn`(): $STRATEGY_TYPE {\n$body\n}\nreturn io.mockk.mockk<$type>(relaxed = true).`$fn`()"
+            }
+            return body
         }
 
         /** Insert a synthetic `EXPORT_FN` member (returning [body]'s value) just before [cls]'s closing brace. */

@@ -17,6 +17,14 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.10</h3>
+        <ul>
+            <li>Strategies whose enclosing function declares Kotlin's <code>context(name: Type)</code>
+                parameters now render, instead of always failing with a "This file has compile
+                errors" notice: the snippet compile now enables the feature (needed on IDEs
+                bundling a Kotlin compiler older than 2.4, which stabilized it), and the
+                generated runner supplies a mock receiver for each context parameter.</li>
+        </ul>
         <h3>0.1.9</h3>
         <ul>
             <li>The diagram no longer leaves behind a stray, half-rendered graph when a render
