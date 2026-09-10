@@ -48,10 +48,17 @@ object RunnerDaemon {
 
     class RunResult(val exitCode: Int, val stdout: String, val stderr: String)
 
-    fun run(javaExe: String, classpath: List<String>, outDir: File, mainClass: String, workDir: File): RunResult? {
+    fun run(
+        javaExe: String,
+        compilerJars: List<String>,
+        classpath: List<String>,
+        outDir: File,
+        mainClass: String,
+        workDir: File,
+    ): RunResult? {
         startIdleWatchdogOnce()
         ensureShutdownHook()
-        return workers.getOrPut(javaExe) { Worker(javaExe) }.run(classpath, outDir, mainClass, workDir)
+        return workers.getOrPut(javaExe) { Worker(javaExe) }.run(compilerJars, classpath, outDir, mainClass, workDir)
     }
 
     fun shutdownAll() {
@@ -91,9 +98,9 @@ object RunnerDaemon {
 
         fun isIdleAt(now: Long): Boolean = process?.isAlive == true && (now - lastUsedAt) > IDLE_TIMEOUT_MS
 
-        fun run(classpath: List<String>, outDir: File, mainClass: String, workDir: File): RunResult? = synchronized(lock) {
+        fun run(compilerJars: List<String>, classpath: List<String>, outDir: File, mainClass: String, workDir: File): RunResult? = synchronized(lock) {
             try {
-                ensureStarted()
+                ensureStarted(compilerJars)
                 lastUsedAt = System.currentTimeMillis()
                 val stdoutFile = File(workDir, "run-stdout.txt")
                 val stderrFile = File(workDir, "run-stderr.txt")
@@ -133,17 +140,20 @@ object RunnerDaemon {
             }
         }
 
-        private fun ensureStarted() {
+        private fun ensureStarted(compilerJars: List<String>) {
             process?.takeIf { it.isAlive }?.let { return }
 
-            // The worker's own launch classpath is just the plugin's classes — it never needs
-            // the target module's jars at launch; those are supplied per-request and loaded
-            // dynamically (see RunnerWorkerMain), which is what lets one worker serve every
+            // The worker's own launch classpath needs the plugin's classes (RunnerWorkerMain
+            // itself, compiled Kotlin — so it needs the Kotlin stdlib too, same as CompilerDaemon's
+            // worker) plus the IDE's bundled kotlinc/lib, which is where that stdlib jar lives. It
+            // never needs the *target* module's jars at launch; those are supplied per-request and
+            // loaded dynamically (see RunnerWorkerMain), which is what lets one worker serve every
             // module that happens to share this SDK.
             val pluginClasses = PathUtil.getJarPathForClass(RunnerDaemon::class.java)
+            val cp = (listOf(pluginClasses) + compilerJars).joinToString(File.pathSeparator)
             val cmd = GeneralCommandLine(javaExe).apply {
                 addParameters(WORKER_JVM_ARGS)
-                addParameters("-cp", pluginClasses)
+                addParameters("-cp", cp)
                 addParameter(WORKER_MAIN)
                 charset = StandardCharsets.UTF_8
             }
@@ -168,6 +178,10 @@ object RunnerDaemon {
     }
 }
 
+/** Box so a `null` line (EOF/failure) can still be [SynchronousQueue.offer]'d — the queue itself
+ *  forbids null elements and throws NullPointerException on `offer(null)`. */
+private class Line(val value: String?)
+
 /**
  * [BufferedReader.readLine] has no timeout, and a hung strategy run must never hang the render
  * that requested it. Reads on a throwaway daemon thread and rendezvous through a
@@ -175,10 +189,10 @@ object RunnerDaemon {
  * unblocks the reader thread once the pipe closes) rather than waiting indefinitely.
  */
 private fun readLineWithTimeout(r: BufferedReader, timeoutMs: Long): String? {
-    val result = SynchronousQueue<String?>()
+    val result = SynchronousQueue<Line>()
     Thread({
         val line = runCatching { r.readLine() }.getOrNull()
-        result.offer(line)
+        result.offer(Line(line))
     }, "koog-runner-worker-read").apply { isDaemon = true; start() }
-    return result.poll(timeoutMs, TimeUnit.MILLISECONDS)
+    return result.poll(timeoutMs, TimeUnit.MILLISECONDS)?.value
 }

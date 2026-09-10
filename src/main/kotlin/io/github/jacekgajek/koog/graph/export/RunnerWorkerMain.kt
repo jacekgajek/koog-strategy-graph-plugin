@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.PrintStream
 import java.lang.reflect.InvocationTargetException
+import java.net.URL
 import java.net.URLClassLoader
 import java.nio.charset.StandardCharsets
 
@@ -70,7 +71,13 @@ object RunnerWorkerMain {
         }
         // The compiled runner is different every call (a fresh temp outDir each render) — never
         // cache it; load it fresh each time as a child of the cached, stable base loader.
-        val runnerLoader = URLClassLoader(arrayOf(File(outDir).toURI().toURL()), base)
+        // Child-first: StrategySnippet compiles a *modified* copy of the strategy's own file
+        // (an injected export method) into outDir, while the module's real, unmodified compiled
+        // output for that same class sits on the base loader's classpath. Default parent-first
+        // delegation would resolve to that unmodified original and miss the injected method
+        // (NoSuchMethodError) — outDir must shadow it, exactly like it did when this was one
+        // flat `-cp outDir:moduleClasspath:...` list ordered with outDir first.
+        val runnerLoader = ChildFirstClassLoader(arrayOf(File(outDir).toURI().toURL()), base)
 
         val outCapture = ByteArrayOutputStream()
         val errCapture = ByteArrayOutputStream()
@@ -98,5 +105,23 @@ object RunnerWorkerMain {
         stdoutFile.writeBytes(outCapture.toByteArray())
         stderrFile.writeBytes(errCapture.toByteArray())
         return exitCode
+    }
+}
+
+/** A [URLClassLoader] that checks its own urls before delegating to the parent — the reverse of
+ *  the JVM's default parent-first order. See the comment at its call site for why. */
+private class ChildFirstClassLoader(urls: Array<URL>, parent: ClassLoader) : URLClassLoader(urls, parent) {
+    override fun loadClass(name: String, resolve: Boolean): Class<*> {
+        synchronized(getClassLoadingLock(name)) {
+            findLoadedClass(name)?.let { return it }
+            val ownClass = try {
+                findClass(name)
+            } catch (_: ClassNotFoundException) {
+                null
+            }
+            val cls = ownClass ?: super.loadClass(name, false)
+            if (resolve) resolveClass(cls)
+            return cls
+        }
     }
 }

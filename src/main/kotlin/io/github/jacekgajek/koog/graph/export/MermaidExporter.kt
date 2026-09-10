@@ -405,7 +405,7 @@ object MermaidExporter {
             // this actually executes the compiled class — it must run under the module's own SDK
             // java, not the IDE's bundled JRE, or a module on a newer JDK than the IDE's JRE
             // would fail with UnsupportedClassVersionError.
-            val fromDaemon = RunnerDaemon.run(prepared.javaExe, runClasspath, outDir, prepared.mainClass, workDir)
+            val fromDaemon = RunnerDaemon.run(prepared.javaExe, compilerJars, runClasspath, outDir, prepared.mainClass, workDir)
             runOutput = if (fromDaemon != null) {
                 RunOutput(fromDaemon.exitCode, fromDaemon.stdout, fromDaemon.stderr)
             } else {
@@ -642,7 +642,7 @@ object MermaidExporter {
         emptyList()
     }
 
-    private fun jarsIn(dir: java.nio.file.Path): List<String> =
+    private fun jarsIn(dir: Path): List<String> =
         Files.list(dir).use { stream ->
             stream.filter { it.extension == "jar" }
                 .map { it.toAbsolutePath().toString() }
