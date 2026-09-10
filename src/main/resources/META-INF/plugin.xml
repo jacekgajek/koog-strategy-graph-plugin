@@ -17,6 +17,14 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.11</h3>
+        <ul>
+            <li>The background compiler worker now caps its own memory and CPU footprint
+                (bounded heap, a lighter garbage collector) instead of inheriting the JVM's
+                default sizing, and shuts itself down after 10 minutes without a render
+                instead of staying resident for the rest of the IDE session. It restarts
+                automatically, with a brief delay, the next time a diagram is generated.</li>
+        </ul>
         <h3>0.1.10</h3>
         <ul>
             <li>Strategies whose enclosing function declares Kotlin's <code>context(name: Type)</code>

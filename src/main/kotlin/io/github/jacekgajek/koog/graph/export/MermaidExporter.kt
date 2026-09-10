@@ -125,29 +125,9 @@ object MermaidExporter {
         // counterpart when there is one; keep `module` (the PSI's own) for scoping same-module
         // source collection, since the referenced helpers sit in the common source set.
         val cpModule = jvmCounterpart(module) ?: module
-        val orderClasspath = OrderEnumerator.orderEntries(cpModule)
-            .recursively()
-            .withoutSdk()
-            .classes()
-            .pathsList
-            .pathList
-
-        val moduleSdkHome = ModuleRootManager.getInstance(cpModule).sdk?.homePath
-        val javaHome = moduleSdkHome ?: System.getProperty("java.home")
-        val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
-
-        // The module's own compiled output must be on the classpath so same-package
-        // siblings (referenced without an import) resolve, and a "friend" so the
-        // runner can read its `internal` declarations. IntelliJ's CompilerModuleExtension
-        // gives us these for JPS builds — but for Gradle-delegated builds it's often
-        // empty (the editor resolves siblings from source, not output). So we also
-        // derive the on-disk Gradle/IDEA output dirs and use whatever actually exists.
-        val ext = CompilerModuleExtension.getInstance(cpModule)
-        val outputs = (listOfNotNull(ext?.compilerOutputPath?.path, ext?.compilerOutputPathForTests?.path) +
-            deriveModuleOutputs(cpModule)).distinct()
-
-        val classpath = (orderClasspath + outputs).distinct()
-        val friendPaths = outputs
+        val info = classpathInfoFor(cpModule)
+        val classpath = info.classpath
+        val friendPaths = info.outputs
 
         // The snippet copies only the strategy's own file verbatim; helpers it references
         // from *other* same-module files (e.g. a `node("…")` factory object) only resolve
@@ -159,21 +139,76 @@ object MermaidExporter {
             val f = strategyFile ?: return@provider emptyList()
             runReadAction { if (f.isValid) collectReferencedSources(f, module) else emptyList() }
         }
-        val jvmTarget = jvmTargetFor(cpModule)
 
         LOG.info(
             "prepare: strategy='${snippet.name}', module='${module.name}'" +
                 (if (cpModule !== module) " (classpath via '${cpModule.name}')" else "") + ", " +
-                "classpath=${classpath.size} entries (orderEntries=${orderClasspath.size}, outputs=${outputs.size}), " +
-                "sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
-                "javaExe=$javaExe, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
-                "jvmTarget=$jvmTarget, snippet=${snippet.source.length} chars",
+                "classpath=${classpath.size} entries (orderEntries=${info.orderEntriesCount}, outputs=${info.outputs.size}), " +
+                "sdkHome=${info.moduleSdkHome ?: "(none, using IDE JRE)"}, " +
+                "javaExe=${info.javaExe}, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
+                "jvmTarget=${info.jvmTarget}, snippet=${snippet.source.length} chars",
         )
-        if (outputs.isEmpty()) {
+        if (info.outputs.isEmpty()) {
             LOG.warn("prepare: no module output dir found — same-package siblings may not resolve; build the module")
         }
-        return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths, jvmTarget, extraSources)
+        return Prepared(snippet.name, snippet.source, classpath, info.javaExe, snippet.mainClass, friendPaths, info.jvmTarget, extraSources)
     }
+
+    /** Everything [prepare] derives purely from a module — expensive, and unchanged until the
+     *  module's roots or build outputs actually change. See [classpathInfoFor]. */
+    private class ModuleClasspathInfo(
+        val classpath: List<String>,
+        val orderEntriesCount: Int,
+        val outputs: List<String>,
+        val moduleSdkHome: String?,
+        val javaExe: String,
+        val jvmTarget: String,
+    )
+
+    // Keyed by Module identity: a Gradle/project re-sync replaces Module instances wholesale, so
+    // stale entries are simply never looked up again rather than actively invalidated by that
+    // path. [invalidateClasspathCache] is still called on every finished build and on
+    // ModuleRootListener roots-changed (see KoogGraphService) so a same-session dependency change
+    // or a module's output directories appearing for the first time are picked up promptly.
+    private val classpathCache = java.util.concurrent.ConcurrentHashMap<Module, ModuleClasspathInfo>()
+
+    /** Drop everything memoized by [classpathInfoFor] — call after anything that could change a
+     *  module's resolved classpath, SDK, or on-disk output directories. */
+    fun invalidateClasspathCache() = classpathCache.clear()
+
+    /**
+     * [OrderEnumerator.orderEntries] walks the module's full transitive dependency graph — for a
+     * modulith with hundreds of modules this is real, read-lock-held work, and [prepare] used to
+     * pay it on every cache-missing render (every substantive edit, and always on Refresh).
+     * Memoized per module instead: the answer only changes when the module's roots/SDK/output
+     * layout does, which is far rarer than "the strategy text changed."
+     */
+    private fun classpathInfoFor(cpModule: Module): ModuleClasspathInfo =
+        classpathCache.getOrPut(cpModule) {
+            val orderClasspath = OrderEnumerator.orderEntries(cpModule)
+                .recursively()
+                .withoutSdk()
+                .classes()
+                .pathsList
+                .pathList
+
+            val moduleSdkHome = ModuleRootManager.getInstance(cpModule).sdk?.homePath
+            val javaHome = moduleSdkHome ?: System.getProperty("java.home")
+            val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
+
+            // The module's own compiled output must be on the classpath so same-package
+            // siblings (referenced without an import) resolve, and a "friend" so the
+            // runner can read its `internal` declarations. IntelliJ's CompilerModuleExtension
+            // gives us these for JPS builds — but for Gradle-delegated builds it's often
+            // empty (the editor resolves siblings from source, not output). So we also
+            // derive the on-disk Gradle/IDEA output dirs and use whatever actually exists.
+            val ext = CompilerModuleExtension.getInstance(cpModule)
+            val outputs = (listOfNotNull(ext?.compilerOutputPath?.path, ext?.compilerOutputPathForTests?.path) +
+                deriveModuleOutputs(cpModule)).distinct()
+
+            val classpath = (orderClasspath + outputs).distinct()
+            ModuleClasspathInfo(classpath, orderClasspath.size, outputs, moduleSdkHome, javaExe, jvmTargetFor(cpModule))
+        }
 
     /**
      * The JVM bytecode target to compile the snippet with. Derived from the module's SDK so
@@ -361,6 +396,12 @@ object MermaidExporter {
         val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars + mockk)
             .joinToString(File.pathSeparator)
         val runCmd = GeneralCommandLine(prepared.javaExe).apply {
+            // This JVM runs once, prints a few KB of diagram text, and exits — it never lives
+            // long enough to benefit from C2's profiling/optimizing (TieredStopAtLevel=1 sticks
+            // to the fast-compiling C1, which is strictly a win for a process this short-lived)
+            // or from a large heap (a single strategy instance + mockk/byte-buddy proxies, not
+            // real production load). Both cut the cold-start latency that dominates a render.
+            addParameters("-Xmx768m", "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1")
             addParameters("-cp", runCp)
             addParameter(prepared.mainClass)
             workDirectory = workDir

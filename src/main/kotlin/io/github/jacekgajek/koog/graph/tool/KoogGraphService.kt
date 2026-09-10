@@ -21,6 +21,8 @@ import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.roots.ModuleRootEvent
+import com.intellij.openapi.roots.ModuleRootListener
 import com.intellij.openapi.ui.FrameWrapper
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
@@ -85,16 +87,30 @@ class KoogGraphService(private val project: Project) : Disposable {
 
     init {
         // A finished build re-creates the module output the diagrams are compiled against,
-        // so any open graph (and the overview) may now render differently — refresh.
+        // so any open graph (and the overview) may now render differently — refresh. It may
+        // also be the first build that creates output dirs MermaidExporter previously cached
+        // as absent, so drop its per-module classpath cache too (cheap to recompute; the
+        // alternative is silently stale "no module output found" behavior post-build).
         project.messageBus.connect(this).subscribe(
             CompilerTopics.COMPILATION_STATUS,
             object : CompilationStatusListener {
                 override fun compilationFinished(aborted: Boolean, errors: Int, warnings: Int, context: CompileContext) {
                     if (aborted || project.isDisposed) return
+                    MermaidExporter.invalidateClasspathCache()
                     ApplicationManager.getApplication().invokeLater({
                         if (!project.isDisposed) refresh()
                     }, ModalityState.any()) { project.isDisposed }
                 }
+            },
+        )
+
+        // A dependency/SDK change or Gradle re-sync can change a module's resolved classpath
+        // without a build running at all — drop the cache so the next render re-derives it
+        // instead of compiling against what's now a stale classpath.
+        project.messageBus.connect(this).subscribe(
+            ModuleRootListener.TOPIC,
+            object : ModuleRootListener {
+                override fun rootsChanged(event: ModuleRootEvent) = MermaidExporter.invalidateClasspathCache()
             },
         )
 

@@ -7,6 +7,8 @@ import java.io.BufferedReader
 import java.io.File
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Manages a warm Kotlin-compiler worker process (see [CompilerWorkerMain]) so the
@@ -20,6 +22,23 @@ object CompilerDaemon {
     private val LOG = logger<CompilerDaemon>()
     private const val WORKER_MAIN = "io.github.jacekgajek.koog.graph.export.CompilerWorkerMain"
 
+    // The worker only ever compiles one strategy snippet (plus a handful of same-file
+    // helpers) against an already-resolved classpath — a few hundred MB is generous. Cap
+    // it explicitly rather than inherit the JBR's ergonomic default (up to 1/4 of physical
+    // RAM), which on a well-provisioned dev box can reserve several GB for a JVM that's
+    // idle almost all the time. UseSerialGC drops G1's background GC threads, which cost
+    // nothing when the heap is this small but otherwise sit around consuming a core.
+    private const val WORKER_HEAP_MB = 512
+    private val WORKER_JVM_ARGS = listOf("-Xmx${WORKER_HEAP_MB}m", "-XX:+UseSerialGC", "-XX:ActiveProcessorCount=2")
+
+    // A diagram is re-rendered on every settled edit (see KoogGraphService.REFRESH_DELAY_MS)
+    // while a tab is open, but most of a session has none open. Recycling the worker after a
+    // stretch of inactivity — mirroring the real Kotlin daemon's own idle-shutdown — trades a
+    // ~1-2s cold start on the next render for not holding compiler classes + heap resident for
+    // hours. Checked well below the timeout so the actual wait is close to IDLE_TIMEOUT_MS.
+    private val IDLE_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(10)
+    private val IDLE_CHECK_MS = TimeUnit.MINUTES.toMillis(1)
+
     class CompileResult(val exitCode: Int, val diagnostics: String)
 
     private val lock = Any()
@@ -27,6 +46,8 @@ object CompilerDaemon {
     private var stdin: OutputStreamWriter? = null
     private var stdout: BufferedReader? = null
     @Volatile private var shutdownHookAdded = false
+    @Volatile private var lastUsedAt: Long = 0L
+    @Volatile private var watchdogStarted = false
 
     /**
      * Compile [srcFiles] into [outDir] using the warm worker. Returns null if the
@@ -45,6 +66,7 @@ object CompilerDaemon {
     ): CompileResult? = synchronized(lock) {
         try {
             ensureStarted(javaExe, compilerJars)
+            lastUsedAt = System.currentTimeMillis()
             val diagFile = File(outDir.parentFile, "compile-diag.txt")
             val reqFile = File(outDir.parentFile, "compile-req.txt")
             reqFile.writeText(
@@ -90,6 +112,7 @@ object CompilerDaemon {
         val pluginClasses = PathUtil.getJarPathForClass(CompilerDaemon::class.java)
         val cp = (listOf(pluginClasses) + compilerJars).joinToString(File.pathSeparator)
         val cmd = GeneralCommandLine(javaExe).apply {
+            addParameters(WORKER_JVM_ARGS)
             addParameters("-cp", cp)
             addParameter(WORKER_MAIN)
             charset = StandardCharsets.UTF_8
@@ -109,6 +132,29 @@ object CompilerDaemon {
             shutdownHookAdded = true
             Runtime.getRuntime().addShutdownHook(Thread { shutdown() })
         }
+        startIdleWatchdogOnce()
+    }
+
+    /**
+     * Recycles the worker after [IDLE_TIMEOUT_MS] of inactivity. Runs on a daemon thread so it
+     * never keeps the IDE process alive on its own; [ensureStarted] restarts the worker lazily
+     * on the next [compile] call, same as a first cold start.
+     */
+    private fun startIdleWatchdogOnce() {
+        if (watchdogStarted) return
+        watchdogStarted = true
+        val watchdog = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "koog-compiler-worker-watchdog").apply { isDaemon = true }
+        }
+        watchdog.scheduleWithFixedDelay({
+            synchronized(lock) {
+                val idleFor = System.currentTimeMillis() - lastUsedAt
+                if (process?.isAlive == true && idleFor > IDLE_TIMEOUT_MS) {
+                    LOG.info("CompilerDaemon: worker idle for ${idleFor}ms, shutting it down")
+                    shutdown()
+                }
+            }
+        }, IDLE_CHECK_MS, IDLE_CHECK_MS, TimeUnit.MILLISECONDS)
     }
 
     fun shutdown() = synchronized(lock) {
