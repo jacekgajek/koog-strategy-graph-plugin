@@ -441,6 +441,9 @@ object MermaidExporter {
             // (allows @OptionalExpectation annotations like @JsName); a no-op for plain JVM sources.
             addParameter("-Xmulti-platform")
             addParameter("-Xcommon-sources=${srcFiles.joinToString(",") { it.absolutePath }}")
+            // See CompilerWorkerMain: needed for `context(name: Type)` syntax on compilers older
+            // than the one that stabilized it (Kotlin 2.4); a harmless no-op on newer ones.
+            addParameter("-Xcontext-parameters")
             // Enable kotlinx-serialization for copied `@Serializable` types (see CompilerWorkerMain).
             CompilerWorkerMain.serializationPlugin(compileClasspath)?.let { addParameter("-Xplugin=$it") }
             addParameters("-no-stdlib", "-no-reflect")

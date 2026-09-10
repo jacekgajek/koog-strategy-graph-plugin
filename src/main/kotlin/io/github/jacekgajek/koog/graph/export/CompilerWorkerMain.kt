@@ -78,6 +78,12 @@ object CompilerWorkerMain {
             // for plain JVM sources: they still compile straight to JVM bytecode.
             add("-Xmulti-platform")
             add("-Xcommon-sources=${srcFiles.joinToString(",")}")
+            // The strategy's file (or a helper it calls) may declare `context(name: Type)`
+            // parameters. Stable since Kotlin 2.4, but the IDE's bundled compiler may be older,
+            // where this flag is required or the copied source fails to parse; on a compiler
+            // where the feature is already stable (or the flag unrecognized), it's a no-op —
+            // kotlinc only warns, it never hard-fails on an unknown/redundant `-X` flag.
+            add("-Xcontext-parameters")
             add("-no-stdlib"); add("-no-reflect")
             addAll(srcFiles)
         }.toTypedArray()
