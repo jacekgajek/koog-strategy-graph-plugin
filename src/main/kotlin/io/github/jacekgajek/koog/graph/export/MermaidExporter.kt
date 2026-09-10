@@ -79,6 +79,9 @@ object MermaidExporter {
     /** An extra source file pulled into the compile: a unique runner-local name + its text. */
     class ExtraSource(val fileName: String, val content: String)
 
+    /** Unifies [RunnerDaemon]'s result with the cold-subprocess fallback's [com.intellij.execution.process.ProcessOutput]. */
+    private class RunOutput(val exitCode: Int, val stdout: String, val stderr: String)
+
     /** A single row for the Problems-style table. */
     data class Problem(val message: String, val detail: String? = null)
 
@@ -393,24 +396,23 @@ object MermaidExporter {
             }
         }
 
-        val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars + mockk)
-            .joinToString(File.pathSeparator)
-        val runCmd = GeneralCommandLine(prepared.javaExe).apply {
-            // This JVM runs once, prints a few KB of diagram text, and exits — it never lives
-            // long enough to benefit from C2's profiling/optimizing (TieredStopAtLevel=1 sticks
-            // to the fast-compiling C1, which is strictly a win for a process this short-lived)
-            // or from a large heap (a single strategy instance + mockk/byte-buddy proxies, not
-            // real production load). Both cut the cold-start latency that dominates a render.
-            addParameters("-Xmx768m", "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1")
-            addParameters("-cp", runCp)
-            addParameter(prepared.mainClass)
-            workDirectory = workDir
-            charset = StandardCharsets.UTF_8
-        }
+        val runClasspath = prepared.moduleClasspath + compilerJars + mockk
 
         LOG.info("run: executing ${prepared.mainClass} (timeout ${RUN_TIMEOUT_MS}ms)…")
-        var runOutput: com.intellij.execution.process.ProcessOutput? = null
-        val runMs = measureTimeMillis { runOutput = exec(runCmd, RUN_TIMEOUT_MS) }
+        var runOutput: RunOutput? = null
+        val runMs = measureTimeMillis {
+            // Unlike the compiler (any modern JVM can run kotlinc, whatever bytecode it emits),
+            // this actually executes the compiled class — it must run under the module's own SDK
+            // java, not the IDE's bundled JRE, or a module on a newer JDK than the IDE's JRE
+            // would fail with UnsupportedClassVersionError.
+            val fromDaemon = RunnerDaemon.run(prepared.javaExe, runClasspath, outDir, prepared.mainClass, workDir)
+            runOutput = if (fromDaemon != null) {
+                RunOutput(fromDaemon.exitCode, fromDaemon.stdout, fromDaemon.stderr)
+            } else {
+                LOG.info("run: runner daemon unavailable — cold run")
+                coldRun(prepared, outDir, runClasspath, workDir)?.let { RunOutput(it.exitCode, it.stdout, it.stderr) }
+            }
+        }
         val ro = runOutput
             ?: return ExportOutcome(prepared.name, null, listOf(Problem("Strategy run timed out", "Execution exceeded ${RUN_TIMEOUT_MS}ms.")), cacheable = false)
                 .also { LOG.warn("run: execution timed out after ${runMs}ms") }
@@ -433,6 +435,29 @@ object MermaidExporter {
         }.trim()
         LOG.warn("run: no diagram markers in output:\n$detail")
         return ExportOutcome(prepared.name, null, listOf(Problem("Ran, but no diagram was produced", detail)))
+    }
+
+    /** One-shot fallback execution: a fresh JVM per call. Returns null on timeout / failure to start. */
+    private fun coldRun(
+        prepared: Prepared,
+        outDir: File,
+        runClasspath: List<String>,
+        workDir: File,
+    ): com.intellij.execution.process.ProcessOutput? {
+        val runCp = (listOf(outDir.absolutePath) + runClasspath).joinToString(File.pathSeparator)
+        val runCmd = GeneralCommandLine(prepared.javaExe).apply {
+            // This JVM runs once, prints a few KB of diagram text, and exits — it never lives
+            // long enough to benefit from C2's profiling/optimizing (TieredStopAtLevel=1 sticks
+            // to the fast-compiling C1, which is strictly a win for a process this short-lived)
+            // or from a large heap (a single strategy instance + mockk/byte-buddy proxies, not
+            // real production load). Both cut the cold-start latency that dominates a render.
+            addParameters("-Xmx768m", "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1")
+            addParameters("-cp", runCp)
+            addParameter(prepared.mainClass)
+            workDirectory = workDir
+            charset = StandardCharsets.UTF_8
+        }
+        return exec(runCmd, RUN_TIMEOUT_MS)
     }
 
     /**
