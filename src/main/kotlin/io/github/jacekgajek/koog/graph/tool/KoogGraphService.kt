@@ -28,6 +28,7 @@ import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.openapi.wm.ToolWindowManager
+import com.intellij.openapi.wm.ex.ToolWindowManagerListener
 import com.intellij.psi.*
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.ui.JBSplitter
@@ -85,6 +86,18 @@ class KoogGraphService(private val project: Project) : Disposable {
     private var overviewGeneration = 0
     private var contentListenerInstalled = false
 
+    /**
+     * Set whenever an edit, build, or roots-change happens while the tool window is hidden.
+     * A closed/collapsed tool window still keeps its [GraphTab]s and their [DocumentListener]s
+     * alive (so state survives re-opening), but there is no point paying for an out-of-process
+     * Kotlin compile to update a diagram nobody can see — that's the CPU this flag avoids.
+     * Cleared by a full [refresh] the next time the tool window is shown again.
+     */
+    private var dirtyWhileHidden = false
+
+    private fun isToolWindowVisible(): Boolean =
+        ToolWindowManager.getInstance(project).getToolWindow(TOOL_WINDOW_ID)?.isVisible == true
+
     init {
         // A finished build re-creates the module output the diagrams are compiled against,
         // so any open graph (and the overview) may now render differently — refresh. It may
@@ -119,6 +132,19 @@ class KoogGraphService(private val project: Project) : Disposable {
         EditorFactory.getInstance().eventMulticaster.addCaretListener(object : CaretListener {
             override fun caretPositionChanged(event: CaretEvent) = onCaretMoved(event)
         }, this)
+
+        // Catch up on whatever was skipped while the tool window was hidden, the moment the
+        // user shows it again — otherwise re-opening it would show a stale diagram.
+        project.messageBus.connect(this).subscribe(
+            ToolWindowManagerListener.TOPIC,
+            object : ToolWindowManagerListener {
+                override fun toolWindowShown(toolWindow: ToolWindow) {
+                    if (toolWindow.id != TOOL_WINDOW_ID || !dirtyWhileHidden) return
+                    dirtyWhileHidden = false
+                    refresh()
+                }
+            },
+        )
     }
 
     private fun onCaretMoved(event: CaretEvent) {
@@ -220,41 +246,61 @@ class KoogGraphService(private val project: Project) : Disposable {
         tab.onName = { frame.title = it }
         // Tie the window's lifetime to the service, and clean up our state when it closes.
         Disposer.register(this, frame)
-        Disposer.register(frame, Disposable {
+        Disposer.register(frame) {
             detached.remove(tab)
             tab.dispose()
-        })
+        }
 
         tab.listenTo(file)
         frame.show()
         tab.render()
     }
 
-    /** Coalesce bursts of edits into a single recompile once typing pauses. */
+    /**
+     * Coalesce bursts of edits into a single recompile once typing pauses - but only while
+     * something is actually on screen to update. A detached window is its own floating frame
+     * (always worth updating live), but [previewTab]/[tabs] live inside the tool window, so
+     * rendering them while it's hidden would burn a real out-of-process Kotlin compile per
+     * edit on a diagram nobody can see; [dirtyWhileHidden] makes sure they catch up once shown.
+     */
     private fun scheduleRefresh() {
+        if (!isToolWindowVisible() && detached.isEmpty()) {
+            dirtyWhileHidden = true
+            return
+        }
         refreshAlarm.cancelAllRequests()
         refreshAlarm.addRequest(::refreshAll, REFRESH_DELAY_MS)
     }
 
     private fun refreshAll() {
         if (project.isDisposed) return
-        previewTab?.render()
-        tabs.toList().forEach { it.render() }
+        if (isToolWindowVisible()) {
+            previewTab?.render()
+            tabs.toList().forEach { it.render() }
+        } else {
+            dirtyWhileHidden = true
+        }
         detached.toList().forEach { it.render() }
     }
 
     /**
      * Re-generate everything currently shown: drop the cache so open graphs recompile
      * from scratch, and re-scan the project. Backs the tool-window refresh button and
-     * the post-build auto-refresh.
+     * the post-build auto-refresh. The tool-window-hosted content (preview, tabs, overview
+     * scan) only actually re-renders while the tool window is visible; detached windows
+     * always do, since each is its own floating frame the user explicitly popped out.
      */
     fun refresh() {
         if (project.isDisposed) return
         cache.clear()
-        previewTab?.forceRender()
-        tabs.toList().forEach { it.forceRender() }
+        if (isToolWindowVisible()) {
+            previewTab?.forceRender()
+            tabs.toList().forEach { it.forceRender() }
+            if (overview != null) scanOverview()
+        } else {
+            dirtyWhileHidden = true
+        }
         detached.toList().forEach { it.forceRender() }
-        if (overview != null) scanOverview()
     }
 
     private fun ensureContentListener(cm: ContentManager) {
@@ -330,7 +376,7 @@ class KoogGraphService(private val project: Project) : Disposable {
         val found = overviewStrategies.getOrNull(index) ?: return
         val target = runReadActionBlocking {
             val call = found.pointer.element ?: return@runReadActionBlocking null
-            val vf = call.containingFile?.virtualFile ?: return@runReadActionBlocking null
+            val vf = call.containingFile.virtualFile ?: return@runReadActionBlocking null
             vf to call.textOffset
         }
         if (target == null) {

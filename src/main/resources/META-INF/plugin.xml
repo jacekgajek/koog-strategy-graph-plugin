@@ -17,6 +17,16 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.12</h3>
+        <ul>
+            <li>Open graphs (and the strategy list preview) no longer auto-recompile while the
+                <em>Koog Strategy</em> tool window is hidden or collapsed &mdash; edits, a
+                finished project build, or a classpath change now just mark the view stale, and
+                it catches up with a single refresh the moment you show the tool window again.
+                A detached graph window still updates live, since it's its own visible frame.
+                This fixes background CPU/compiler churn from graphs left open behind the tool
+                window while working elsewhere in the project.</li>
+        </ul>
         <h3>0.1.11</h3>
         <ul>
             <li>Performance improvements: rendering a diagram is noticeably faster, and the
