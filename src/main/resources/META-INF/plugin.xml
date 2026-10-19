@@ -17,6 +17,16 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.13</h3>
+        <ul>
+            <li>Modules on a JDK newer than the IDE's bundled Kotlin compiler supports (e.g. JDK 27
+                with a compiler whose newest <code>-jvm-target</code> is 26) no longer fail with a
+                misleading "This file has compile errors" notice. The snippet is now compiled for
+                the newest target the compiler accepts, which runs fine on the newer JDK.</li>
+            <li>Compile failures that aren't attributable to any source file (a rejected compiler
+                flag, a bad classpath entry, an internal compiler error) are now reported with the
+                actual diagnostic instead of being mistaken for errors in the strategy's file.</li>
+        </ul>
         <h3>0.1.12</h3>
         <ul>
             <li>Open graphs (and the strategy list preview) no longer auto-recompile while the

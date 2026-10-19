@@ -382,17 +382,26 @@ object MermaidExporter {
             // Don't cache: compile errors can depend on external state (an unbuilt
             // module, a stale classpath) that a rebuild fixes without the strategy
             // text changing — caching would pin the stale error.
-            return if (compileErrorIsExternal(compile.diagnostics)) {
-                // The failure is in another file (a stale/unbuilt dependency the user
-                // can't see is the culprit). Surface a "rebuild & refresh" hint instead of
-                // the raw diagnostics (whose temp-dir paths read like a plugin bug).
-                ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false, compileError = true)
-            } else {
-                // The only errors are in the strategy's own file — the user already sees them
-                // in their editor as they type. The UI keeps the current diagram if there is
-                // one (no nagging), or shows a brief notice if there's nothing to keep.
-                LOG.info("run: compile errors are confined to the strategy's own file")
-                ExportOutcome(prepared.name, null, emptyList(), cacheable = false, inFileCompileError = true)
+            return when (classifyCompileErrors(compile.diagnostics)) {
+                CompileErrorKind.EXTERNAL ->
+                    // The failure is in another file (a stale/unbuilt dependency the user
+                    // can't see is the culprit). Surface a "rebuild & refresh" hint instead of
+                    // the raw diagnostics (whose temp-dir paths read like a plugin bug).
+                    ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false, compileError = true)
+                CompileErrorKind.IN_FILE -> {
+                    // The only errors are in the strategy's own file — the user already sees them
+                    // in their editor as they type. The UI keeps the current diagram if there is
+                    // one (no nagging), or shows a brief notice if there's nothing to keep.
+                    LOG.info("run: compile errors are confined to the strategy's own file")
+                    ExportOutcome(prepared.name, null, emptyList(), cacheable = false, inFileCompileError = true)
+                }
+                CompileErrorKind.TOOLCHAIN -> {
+                    // Not attributable to any source file (a rejected compiler flag, a bad
+                    // classpath entry, an internal compiler error). Neither "fix your file" nor
+                    // "rebuild" is the right advice, so show the actual diagnostics.
+                    LOG.info("run: compile failed with no file-attributed errors — reporting diagnostics")
+                    ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false)
+                }
             }
         }
 
@@ -473,12 +482,63 @@ object MermaidExporter {
         compileClasspath: List<String>,
         workDir: File,
     ): CompilerDaemon.CompileResult? {
+        val target = clampJvmTarget(prepared.jvmTarget)
+        val result = compileWith(prepared, compilerJars, srcFiles, outDir, compileClasspath, target, workDir) ?: return null
+        // The module SDK is newer than the IDE's bundled kotlinc knows about (e.g. JDK 27 vs a
+        // compiler whose newest target is 26). The bytecode we emit only has to *run* on that
+        // SDK, and older bytecode does — so retry with the newest target the compiler supports,
+        // and remember it so later renders don't pay for the failed attempt.
+        val supportedMax = result.takeIf { it.exitCode != 0 }?.let { maxSupportedJvmTarget(it.diagnostics) } ?: return result
+        if (supportedMax >= (target.toIntOrNull() ?: return result)) return result
+        LOG.info("run: kotlinc rejected -jvm-target $target (newest supported: $supportedMax) — retrying with $supportedMax")
+        maxKnownJvmTarget = supportedMax
+        return compileWith(prepared, compilerJars, srcFiles, outDir, compileClasspath, supportedMax.toString(), workDir)
+    }
+
+    private fun compileWith(
+        prepared: Prepared,
+        compilerJars: List<String>,
+        srcFiles: List<File>,
+        outDir: File,
+        compileClasspath: List<String>,
+        jvmTarget: String,
+        workDir: File,
+    ): CompilerDaemon.CompileResult? {
         val fromDaemon = CompilerDaemon.compile(
-            ideJavaExe(), compilerJars, srcFiles, outDir, compileClasspath, prepared.jvmTarget, prepared.friendPaths,
+            ideJavaExe(), compilerJars, srcFiles, outDir, compileClasspath, jvmTarget, prepared.friendPaths,
         )
         if (fromDaemon != null) return fromDaemon
         LOG.info("run: daemon unavailable — cold compile")
-        return coldCompile(prepared.javaExe, compilerJars, srcFiles, outDir, compileClasspath, prepared.friendPaths, prepared.jvmTarget, workDir)
+        return coldCompile(prepared.javaExe, compilerJars, srcFiles, outDir, compileClasspath, prepared.friendPaths, jvmTarget, workDir)
+    }
+
+    /**
+     * The newest `-jvm-target` the bundled kotlinc accepted after rejecting a higher one, or
+     * null until that happens. Learned at runtime from the compiler's own error message rather
+     * than from a version table, so a newer bundled compiler is picked up automatically.
+     */
+    @Volatile
+    private var maxKnownJvmTarget: Int? = null
+
+    private fun clampJvmTarget(requested: String): String {
+        val max = maxKnownJvmTarget ?: return requested
+        val n = requested.toIntOrNull() ?: return requested
+        return minOf(n, max).toString()
+    }
+
+    /**
+     * Parse the newest supported target out of kotlinc's
+     * `error: unknown JVM target version: 27 / Supported versions: 1.8, 9, …, 26` diagnostic.
+     * Null when the diagnostics aren't that error.
+     */
+    internal fun maxSupportedJvmTarget(diagnostics: String): Int? {
+        if (!diagnostics.contains("unknown JVM target version", ignoreCase = true)) return null
+        val supported = diagnostics.lineSequence()
+            .firstOrNull { it.trimStart().startsWith("Supported versions:", ignoreCase = true) }
+            ?: return null
+        return Regex("""\d+(?:\.\d+)?""").findAll(supported.substringAfter(':'))
+            .mapNotNull { it.value.substringAfterLast('.').toIntOrNull() }
+            .maxOrNull()
     }
 
     /** Whether a failed compile looks like missing classpath symbols (an unbuilt module). */
@@ -521,19 +581,35 @@ object MermaidExporter {
         return CompilerDaemon.CompileResult(out.exitCode, out.stderr.ifBlank { out.stdout })
     }
 
+    internal enum class CompileErrorKind {
+        /** At least one error is in a file other than the strategy's own (a stale dependency). */
+        EXTERNAL,
+        /** Every error is in the strategy's own file — the user already sees them in the editor. */
+        IN_FILE,
+        /** No error names a source file: a rejected flag, bad classpath, internal compiler error… */
+        TOOLCHAIN,
+    }
+
     /**
-     * Whether the failed compile reports an error in a file *other than* the strategy's own.
-     * The snippet is a verbatim copy of the strategy's file ([StrategySnippet.FILE_NAME]);
-     * referenced sibling files are pulled in as `extra*` sources. An error outside the
-     * snippet means a rebuild is needed for a reason the user can't see in the file they're
-     * editing, so it's worth surfacing; an error confined to the snippet is already visible
-     * to them as they type. Errors with no attributable file (rare) don't count as external.
+     * Classify a failed compile by where its errors point. The snippet is a verbatim copy of
+     * the strategy's file ([StrategySnippet.FILE_NAME]); referenced sibling files are pulled
+     * in as `extra*` sources. An error outside the snippet means a rebuild is needed for a
+     * reason the user can't see in the file they're editing, so it's worth surfacing; one
+     * confined to the snippet is already visible to them as they type. Errors with no
+     * attributable file at all (e.g. `error: unknown JVM target version`) are the plugin's or
+     * the toolchain's problem, not the user's code — telling them "fix your file" would be wrong.
      */
-    private fun compileErrorIsExternal(diagnostics: String): Boolean =
-        diagnostics.lineSequence()
-            .filter { it.contains(": error:") }
-            .mapNotNull { errorFileName(it) }
-            .any { it != StrategySnippet.FILE_NAME }
+    internal fun classifyCompileErrors(diagnostics: String): CompileErrorKind {
+        val files = diagnostics.lineSequence()
+            .filter { it.contains("error:") }
+            .map { errorFileName(it) }
+            .toList()
+        return when {
+            files.any { it != null && it != StrategySnippet.FILE_NAME } -> CompileErrorKind.EXTERNAL
+            files.any { it == StrategySnippet.FILE_NAME } -> CompileErrorKind.IN_FILE
+            else -> CompileErrorKind.TOOLCHAIN
+        }
+    }
 
     /** The source-file basename in a kotlinc diagnostic line ("/path/Foo.kt:1:2: error: …" → "Foo.kt"). */
     private fun errorFileName(line: String): String? {
