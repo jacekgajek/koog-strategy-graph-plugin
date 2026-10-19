@@ -79,6 +79,9 @@ object MermaidExporter {
     /** An extra source file pulled into the compile: a unique runner-local name + its text. */
     class ExtraSource(val fileName: String, val content: String)
 
+    /** Unifies [RunnerDaemon]'s result with the cold-subprocess fallback's [com.intellij.execution.process.ProcessOutput]. */
+    private class RunOutput(val exitCode: Int, val stdout: String, val stderr: String)
+
     /** A single row for the Problems-style table. */
     data class Problem(val message: String, val detail: String? = null)
 
@@ -125,29 +128,9 @@ object MermaidExporter {
         // counterpart when there is one; keep `module` (the PSI's own) for scoping same-module
         // source collection, since the referenced helpers sit in the common source set.
         val cpModule = jvmCounterpart(module) ?: module
-        val orderClasspath = OrderEnumerator.orderEntries(cpModule)
-            .recursively()
-            .withoutSdk()
-            .classes()
-            .pathsList
-            .pathList
-
-        val moduleSdkHome = ModuleRootManager.getInstance(cpModule).sdk?.homePath
-        val javaHome = moduleSdkHome ?: System.getProperty("java.home")
-        val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
-
-        // The module's own compiled output must be on the classpath so same-package
-        // siblings (referenced without an import) resolve, and a "friend" so the
-        // runner can read its `internal` declarations. IntelliJ's CompilerModuleExtension
-        // gives us these for JPS builds — but for Gradle-delegated builds it's often
-        // empty (the editor resolves siblings from source, not output). So we also
-        // derive the on-disk Gradle/IDEA output dirs and use whatever actually exists.
-        val ext = CompilerModuleExtension.getInstance(cpModule)
-        val outputs = (listOfNotNull(ext?.compilerOutputPath?.path, ext?.compilerOutputPathForTests?.path) +
-            deriveModuleOutputs(cpModule)).distinct()
-
-        val classpath = (orderClasspath + outputs).distinct()
-        val friendPaths = outputs
+        val info = classpathInfoFor(cpModule)
+        val classpath = info.classpath
+        val friendPaths = info.outputs
 
         // The snippet copies only the strategy's own file verbatim; helpers it references
         // from *other* same-module files (e.g. a `node("…")` factory object) only resolve
@@ -159,21 +142,76 @@ object MermaidExporter {
             val f = strategyFile ?: return@provider emptyList()
             runReadAction { if (f.isValid) collectReferencedSources(f, module) else emptyList() }
         }
-        val jvmTarget = jvmTargetFor(cpModule)
 
         LOG.info(
             "prepare: strategy='${snippet.name}', module='${module.name}'" +
                 (if (cpModule !== module) " (classpath via '${cpModule.name}')" else "") + ", " +
-                "classpath=${classpath.size} entries (orderEntries=${orderClasspath.size}, outputs=${outputs.size}), " +
-                "sdkHome=${moduleSdkHome ?: "(none, using IDE JRE)"}, " +
-                "javaExe=$javaExe, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
-                "jvmTarget=$jvmTarget, snippet=${snippet.source.length} chars",
+                "classpath=${classpath.size} entries (orderEntries=${info.orderEntriesCount}, outputs=${info.outputs.size}), " +
+                "sdkHome=${info.moduleSdkHome ?: "(none, using IDE JRE)"}, " +
+                "javaExe=${info.javaExe}, mainClass=${snippet.mainClass}, friendPaths=$friendPaths, " +
+                "jvmTarget=${info.jvmTarget}, snippet=${snippet.source.length} chars",
         )
-        if (outputs.isEmpty()) {
+        if (info.outputs.isEmpty()) {
             LOG.warn("prepare: no module output dir found — same-package siblings may not resolve; build the module")
         }
-        return Prepared(snippet.name, snippet.source, classpath, javaExe, snippet.mainClass, friendPaths, jvmTarget, extraSources)
+        return Prepared(snippet.name, snippet.source, classpath, info.javaExe, snippet.mainClass, friendPaths, info.jvmTarget, extraSources)
     }
+
+    /** Everything [prepare] derives purely from a module — expensive, and unchanged until the
+     *  module's roots or build outputs actually change. See [classpathInfoFor]. */
+    private class ModuleClasspathInfo(
+        val classpath: List<String>,
+        val orderEntriesCount: Int,
+        val outputs: List<String>,
+        val moduleSdkHome: String?,
+        val javaExe: String,
+        val jvmTarget: String,
+    )
+
+    // Keyed by Module identity: a Gradle/project re-sync replaces Module instances wholesale, so
+    // stale entries are simply never looked up again rather than actively invalidated by that
+    // path. [invalidateClasspathCache] is still called on every finished build and on
+    // ModuleRootListener roots-changed (see KoogGraphService) so a same-session dependency change
+    // or a module's output directories appearing for the first time are picked up promptly.
+    private val classpathCache = java.util.concurrent.ConcurrentHashMap<Module, ModuleClasspathInfo>()
+
+    /** Drop everything memoized by [classpathInfoFor] — call after anything that could change a
+     *  module's resolved classpath, SDK, or on-disk output directories. */
+    fun invalidateClasspathCache() = classpathCache.clear()
+
+    /**
+     * [OrderEnumerator.orderEntries] walks the module's full transitive dependency graph — for a
+     * modulith with hundreds of modules this is real, read-lock-held work, and [prepare] used to
+     * pay it on every cache-missing render (every substantive edit, and always on Refresh).
+     * Memoized per module instead: the answer only changes when the module's roots/SDK/output
+     * layout does, which is far rarer than "the strategy text changed."
+     */
+    private fun classpathInfoFor(cpModule: Module): ModuleClasspathInfo =
+        classpathCache.getOrPut(cpModule) {
+            val orderClasspath = OrderEnumerator.orderEntries(cpModule)
+                .recursively()
+                .withoutSdk()
+                .classes()
+                .pathsList
+                .pathList
+
+            val moduleSdkHome = ModuleRootManager.getInstance(cpModule).sdk?.homePath
+            val javaHome = moduleSdkHome ?: System.getProperty("java.home")
+            val javaExe = File(File(javaHome, "bin"), if (isWindows()) "java.exe" else "java").absolutePath
+
+            // The module's own compiled output must be on the classpath so same-package
+            // siblings (referenced without an import) resolve, and a "friend" so the
+            // runner can read its `internal` declarations. IntelliJ's CompilerModuleExtension
+            // gives us these for JPS builds — but for Gradle-delegated builds it's often
+            // empty (the editor resolves siblings from source, not output). So we also
+            // derive the on-disk Gradle/IDEA output dirs and use whatever actually exists.
+            val ext = CompilerModuleExtension.getInstance(cpModule)
+            val outputs = (listOfNotNull(ext?.compilerOutputPath?.path, ext?.compilerOutputPathForTests?.path) +
+                deriveModuleOutputs(cpModule)).distinct()
+
+            val classpath = (orderClasspath + outputs).distinct()
+            ModuleClasspathInfo(classpath, orderClasspath.size, outputs, moduleSdkHome, javaExe, jvmTargetFor(cpModule))
+        }
 
     /**
      * The JVM bytecode target to compile the snippet with. Derived from the module's SDK so
@@ -344,32 +382,46 @@ object MermaidExporter {
             // Don't cache: compile errors can depend on external state (an unbuilt
             // module, a stale classpath) that a rebuild fixes without the strategy
             // text changing — caching would pin the stale error.
-            return if (compileErrorIsExternal(compile.diagnostics)) {
-                // The failure is in another file (a stale/unbuilt dependency the user
-                // can't see is the culprit). Surface a "rebuild & refresh" hint instead of
-                // the raw diagnostics (whose temp-dir paths read like a plugin bug).
-                ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false, compileError = true)
-            } else {
-                // The only errors are in the strategy's own file — the user already sees them
-                // in their editor as they type. The UI keeps the current diagram if there is
-                // one (no nagging), or shows a brief notice if there's nothing to keep.
-                LOG.info("run: compile errors are confined to the strategy's own file")
-                ExportOutcome(prepared.name, null, emptyList(), cacheable = false, inFileCompileError = true)
+            return when (classifyCompileErrors(compile.diagnostics)) {
+                CompileErrorKind.EXTERNAL ->
+                    // The failure is in another file (a stale/unbuilt dependency the user
+                    // can't see is the culprit). Surface a "rebuild & refresh" hint instead of
+                    // the raw diagnostics (whose temp-dir paths read like a plugin bug).
+                    ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false, compileError = true)
+                CompileErrorKind.IN_FILE -> {
+                    // The only errors are in the strategy's own file — the user already sees them
+                    // in their editor as they type. The UI keeps the current diagram if there is
+                    // one (no nagging), or shows a brief notice if there's nothing to keep.
+                    LOG.info("run: compile errors are confined to the strategy's own file")
+                    ExportOutcome(prepared.name, null, emptyList(), cacheable = false, inFileCompileError = true)
+                }
+                CompileErrorKind.TOOLCHAIN -> {
+                    // Not attributable to any source file (a rejected compiler flag, a bad
+                    // classpath entry, an internal compiler error). Neither "fix your file" nor
+                    // "rebuild" is the right advice, so show the actual diagnostics.
+                    LOG.info("run: compile failed with no file-attributed errors — reporting diagnostics")
+                    ExportOutcome(prepared.name, null, parseCompileDiagnostics(compile.diagnostics), cacheable = false)
+                }
             }
         }
 
-        val runCp = (listOf(outDir.absolutePath) + prepared.moduleClasspath + compilerJars + mockk)
-            .joinToString(File.pathSeparator)
-        val runCmd = GeneralCommandLine(prepared.javaExe).apply {
-            addParameters("-cp", runCp)
-            addParameter(prepared.mainClass)
-            workDirectory = workDir
-            charset = StandardCharsets.UTF_8
-        }
+        val runClasspath = prepared.moduleClasspath + compilerJars + mockk
 
         LOG.info("run: executing ${prepared.mainClass} (timeout ${RUN_TIMEOUT_MS}ms)…")
-        var runOutput: com.intellij.execution.process.ProcessOutput? = null
-        val runMs = measureTimeMillis { runOutput = exec(runCmd, RUN_TIMEOUT_MS) }
+        var runOutput: RunOutput? = null
+        val runMs = measureTimeMillis {
+            // Unlike the compiler (any modern JVM can run kotlinc, whatever bytecode it emits),
+            // this actually executes the compiled class — it must run under the module's own SDK
+            // java, not the IDE's bundled JRE, or a module on a newer JDK than the IDE's JRE
+            // would fail with UnsupportedClassVersionError.
+            val fromDaemon = RunnerDaemon.run(prepared.javaExe, compilerJars, runClasspath, outDir, prepared.mainClass, workDir)
+            runOutput = if (fromDaemon != null) {
+                RunOutput(fromDaemon.exitCode, fromDaemon.stdout, fromDaemon.stderr)
+            } else {
+                LOG.info("run: runner daemon unavailable — cold run")
+                coldRun(prepared, outDir, runClasspath, workDir)?.let { RunOutput(it.exitCode, it.stdout, it.stderr) }
+            }
+        }
         val ro = runOutput
             ?: return ExportOutcome(prepared.name, null, listOf(Problem("Strategy run timed out", "Execution exceeded ${RUN_TIMEOUT_MS}ms.")), cacheable = false)
                 .also { LOG.warn("run: execution timed out after ${runMs}ms") }
@@ -394,6 +446,29 @@ object MermaidExporter {
         return ExportOutcome(prepared.name, null, listOf(Problem("Ran, but no diagram was produced", detail)))
     }
 
+    /** One-shot fallback execution: a fresh JVM per call. Returns null on timeout / failure to start. */
+    private fun coldRun(
+        prepared: Prepared,
+        outDir: File,
+        runClasspath: List<String>,
+        workDir: File,
+    ): com.intellij.execution.process.ProcessOutput? {
+        val runCp = (listOf(outDir.absolutePath) + runClasspath).joinToString(File.pathSeparator)
+        val runCmd = GeneralCommandLine(prepared.javaExe).apply {
+            // This JVM runs once, prints a few KB of diagram text, and exits — it never lives
+            // long enough to benefit from C2's profiling/optimizing (TieredStopAtLevel=1 sticks
+            // to the fast-compiling C1, which is strictly a win for a process this short-lived)
+            // or from a large heap (a single strategy instance + mockk/byte-buddy proxies, not
+            // real production load). Both cut the cold-start latency that dominates a render.
+            addParameters("-Xmx768m", "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1")
+            addParameters("-cp", runCp)
+            addParameter(prepared.mainClass)
+            workDirectory = workDir
+            charset = StandardCharsets.UTF_8
+        }
+        return exec(runCmd, RUN_TIMEOUT_MS)
+    }
+
     /**
      * Compile [srcFiles] with the warm daemon, falling back to a cold one-shot. The daemon
      * runs with the IDE's JRE; the bytecode target is fixed by `prepared.jvmTarget`, so it's
@@ -407,12 +482,63 @@ object MermaidExporter {
         compileClasspath: List<String>,
         workDir: File,
     ): CompilerDaemon.CompileResult? {
+        val target = clampJvmTarget(prepared.jvmTarget)
+        val result = compileWith(prepared, compilerJars, srcFiles, outDir, compileClasspath, target, workDir) ?: return null
+        // The module SDK is newer than the IDE's bundled kotlinc knows about (e.g. JDK 27 vs a
+        // compiler whose newest target is 26). The bytecode we emit only has to *run* on that
+        // SDK, and older bytecode does — so retry with the newest target the compiler supports,
+        // and remember it so later renders don't pay for the failed attempt.
+        val supportedMax = result.takeIf { it.exitCode != 0 }?.let { maxSupportedJvmTarget(it.diagnostics) } ?: return result
+        if (supportedMax >= (target.toIntOrNull() ?: return result)) return result
+        LOG.info("run: kotlinc rejected -jvm-target $target (newest supported: $supportedMax) — retrying with $supportedMax")
+        maxKnownJvmTarget = supportedMax
+        return compileWith(prepared, compilerJars, srcFiles, outDir, compileClasspath, supportedMax.toString(), workDir)
+    }
+
+    private fun compileWith(
+        prepared: Prepared,
+        compilerJars: List<String>,
+        srcFiles: List<File>,
+        outDir: File,
+        compileClasspath: List<String>,
+        jvmTarget: String,
+        workDir: File,
+    ): CompilerDaemon.CompileResult? {
         val fromDaemon = CompilerDaemon.compile(
-            ideJavaExe(), compilerJars, srcFiles, outDir, compileClasspath, prepared.jvmTarget, prepared.friendPaths,
+            ideJavaExe(), compilerJars, srcFiles, outDir, compileClasspath, jvmTarget, prepared.friendPaths,
         )
         if (fromDaemon != null) return fromDaemon
         LOG.info("run: daemon unavailable — cold compile")
-        return coldCompile(prepared.javaExe, compilerJars, srcFiles, outDir, compileClasspath, prepared.friendPaths, prepared.jvmTarget, workDir)
+        return coldCompile(prepared.javaExe, compilerJars, srcFiles, outDir, compileClasspath, prepared.friendPaths, jvmTarget, workDir)
+    }
+
+    /**
+     * The newest `-jvm-target` the bundled kotlinc accepted after rejecting a higher one, or
+     * null until that happens. Learned at runtime from the compiler's own error message rather
+     * than from a version table, so a newer bundled compiler is picked up automatically.
+     */
+    @Volatile
+    private var maxKnownJvmTarget: Int? = null
+
+    private fun clampJvmTarget(requested: String): String {
+        val max = maxKnownJvmTarget ?: return requested
+        val n = requested.toIntOrNull() ?: return requested
+        return minOf(n, max).toString()
+    }
+
+    /**
+     * Parse the newest supported target out of kotlinc's
+     * `error: unknown JVM target version: 27 / Supported versions: 1.8, 9, …, 26` diagnostic.
+     * Null when the diagnostics aren't that error.
+     */
+    internal fun maxSupportedJvmTarget(diagnostics: String): Int? {
+        if (!diagnostics.contains("unknown JVM target version", ignoreCase = true)) return null
+        val supported = diagnostics.lineSequence()
+            .firstOrNull { it.trimStart().startsWith("Supported versions:", ignoreCase = true) }
+            ?: return null
+        return Regex("""\d+(?:\.\d+)?""").findAll(supported.substringAfter(':'))
+            .mapNotNull { it.value.substringAfterLast('.').toIntOrNull() }
+            .maxOrNull()
     }
 
     /** Whether a failed compile looks like missing classpath symbols (an unbuilt module). */
@@ -455,19 +581,35 @@ object MermaidExporter {
         return CompilerDaemon.CompileResult(out.exitCode, out.stderr.ifBlank { out.stdout })
     }
 
+    internal enum class CompileErrorKind {
+        /** At least one error is in a file other than the strategy's own (a stale dependency). */
+        EXTERNAL,
+        /** Every error is in the strategy's own file — the user already sees them in the editor. */
+        IN_FILE,
+        /** No error names a source file: a rejected flag, bad classpath, internal compiler error… */
+        TOOLCHAIN,
+    }
+
     /**
-     * Whether the failed compile reports an error in a file *other than* the strategy's own.
-     * The snippet is a verbatim copy of the strategy's file ([StrategySnippet.FILE_NAME]);
-     * referenced sibling files are pulled in as `extra*` sources. An error outside the
-     * snippet means a rebuild is needed for a reason the user can't see in the file they're
-     * editing, so it's worth surfacing; an error confined to the snippet is already visible
-     * to them as they type. Errors with no attributable file (rare) don't count as external.
+     * Classify a failed compile by where its errors point. The snippet is a verbatim copy of
+     * the strategy's file ([StrategySnippet.FILE_NAME]); referenced sibling files are pulled
+     * in as `extra*` sources. An error outside the snippet means a rebuild is needed for a
+     * reason the user can't see in the file they're editing, so it's worth surfacing; one
+     * confined to the snippet is already visible to them as they type. Errors with no
+     * attributable file at all (e.g. `error: unknown JVM target version`) are the plugin's or
+     * the toolchain's problem, not the user's code — telling them "fix your file" would be wrong.
      */
-    private fun compileErrorIsExternal(diagnostics: String): Boolean =
-        diagnostics.lineSequence()
-            .filter { it.contains(": error:") }
-            .mapNotNull { errorFileName(it) }
-            .any { it != StrategySnippet.FILE_NAME }
+    internal fun classifyCompileErrors(diagnostics: String): CompileErrorKind {
+        val files = diagnostics.lineSequence()
+            .filter { it.contains("error:") }
+            .map { errorFileName(it) }
+            .toList()
+        return when {
+            files.any { it != null && it != StrategySnippet.FILE_NAME } -> CompileErrorKind.EXTERNAL
+            files.any { it == StrategySnippet.FILE_NAME } -> CompileErrorKind.IN_FILE
+            else -> CompileErrorKind.TOOLCHAIN
+        }
+    }
 
     /** The source-file basename in a kotlinc diagnostic line ("/path/Foo.kt:1:2: error: …" → "Foo.kt"). */
     private fun errorFileName(line: String): String? {
@@ -576,7 +718,7 @@ object MermaidExporter {
         emptyList()
     }
 
-    private fun jarsIn(dir: java.nio.file.Path): List<String> =
+    private fun jarsIn(dir: Path): List<String> =
         Files.list(dir).use { stream ->
             stream.filter { it.extension == "jar" }
                 .map { it.toAbsolutePath().toString() }
