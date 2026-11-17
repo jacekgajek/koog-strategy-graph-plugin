@@ -17,6 +17,24 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.15</h3>
+        <ul>
+            <li>Nodes built through a chain of helper functions (<code>val gate by gate(emit)</code> where
+                <code>gate(&hellip;) = pauseNode(GATE_NAME, &hellip;)</code> and
+                <code>pauseNode(name, &hellip;) = node(name) {&hellip;}</code>) are now clickable, and so are
+                their edges: the name is followed through each helper's parameters, named or positional,
+                including default values. Previously only a direct <code>node("&hellip;")</code> inside a
+                single helper was recognised.</li>
+        </ul>
+        <h3>0.1.14</h3>
+        <ul>
+            <li>Nodes and edges whose name comes from a constant (<code>node(EMIT_TOOL_RESULTS_NODE)</code>,
+                a companion <code>const val</code>, a constant from another file, a
+                <code>"$PREFIX &hellip;"</code> template or a <code>+</code> concatenation of constants)
+                are now clickable, and the caret-to-diagram highlight finds them too. Previously only
+                a string literal was recognised, so such nodes fell back to the variable name and
+                never matched the diagram's label.</li>
+        </ul>
         <h3>0.1.13</h3>
         <ul>
             <li>Modules on a JDK newer than the IDE's bundled Kotlin compiler supports (e.g. JDK 27
