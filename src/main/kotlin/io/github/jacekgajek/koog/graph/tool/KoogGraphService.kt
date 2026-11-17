@@ -37,6 +37,7 @@ import com.intellij.util.Alarm
 import com.intellij.util.concurrency.AppExecutorUtil
 import io.github.jacekgajek.koog.graph.export.MermaidExporter
 import io.github.jacekgajek.koog.graph.index.StrategyIndex
+import io.github.jacekgajek.koog.graph.parser.NodeNames
 import io.github.jacekgajek.koog.graph.tool.KoogGraphService.Companion.canonicalKey
 import io.github.jacekgajek.koog.graph.ui.StrategyDiagramPanel
 import io.github.jacekgajek.koog.graph.ui.StrategyListPanel
@@ -706,53 +707,8 @@ class KoogGraphService(private val project: Project) : Disposable {
             }
         }
 
-        /**
-         * The display name Koog gives a node: the explicit `name`/string argument of its
-         * delegate, or — when the delegate calls a factory function — the name of the
-         * `node(…)` built inside that helper; otherwise the property name. The factory is
-         * resolved by reference, so it works whether it's a same-file function or one in
-         * another file (e.g. `Obj.makeNode()`).
-         */
-        private fun nodeDisplayName(prop: KtProperty): String {
-            val name = prop.name ?: ""
-            val delegateCall = delegateCallOf(prop) ?: return name
-            explicitNodeName(delegateCall)?.let { return it }
-
-            val fn = (delegateCall.calleeExpression as? KtNameReferenceExpression)
-                ?.reference?.resolve() as? KtNamedFunction ?: return name
-            // Only read the name out of a *source* helper. Descending into a decompiled
-            // library function would force its stub/AST to load — a slow, index-touching
-            // operation — and library factories carry no user `node("…")` name anyway.
-            if (fn.containingKtFile.isCompiled) return name
-            return PsiTreeUtil.findChildrenOfType(fn, KtCallExpression::class.java)
-                .firstNotNullOfOrNull { c ->
-                    val callee = (c.calleeExpression as? KtNameReferenceExpression)?.getReferencedName()
-                    if (callee?.startsWith("node") == true) explicitNodeName(c) else null
-                } ?: name
-        }
-
-        /** The call a delegate ultimately makes: `foo()` directly, or the `foo()` in `Receiver.foo()`. */
-        private fun delegateCallOf(prop: KtProperty): KtCallExpression? =
-            when (val d = prop.delegateExpression) {
-                is KtCallExpression -> d
-                is KtDotQualifiedExpression -> d.selectorExpression as? KtCallExpression
-                else -> null
-            }
-
-        /** The string passed as `name = "…"` or the first positional string literal, if any. */
-        private fun explicitNodeName(call: KtCallExpression): String? {
-            call.valueArguments.forEach { arg ->
-                val literal = arg.getArgumentExpression() as? KtStringTemplateExpression ?: return@forEach
-                if (arg.getArgumentName()?.asName?.asString() == "name") return literalText(literal)
-            }
-            return call.valueArguments
-                .firstOrNull { it.getArgumentName() == null }
-                ?.let { it.getArgumentExpression() as? KtStringTemplateExpression }
-                ?.let { literalText(it) }
-        }
-
-        private fun literalText(template: KtStringTemplateExpression): String =
-            template.entries.joinToString("") { it.text }
+        /** The runtime display name of a node declaration; see [NodeNames.displayName]. */
+        private fun nodeDisplayName(prop: KtProperty): String = NodeNames.displayName(prop)
 
         /** The first (receiver-most) referenced name within an expression, or null. */
         private fun leadingName(expr: KtExpression?): String? = when (expr) {
